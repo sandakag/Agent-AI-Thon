@@ -124,6 +124,12 @@ def _default_action(failure_type: str) -> str:
     ft = (failure_type or "").lower()
     if "schema" in ft:
         return "Validate + resolve field aliases; quarantine bad records before load."
+    if "latency" in ft or "timeout" in ft or "load" in ft:
+        return (
+            "Scale out consumers + raise ETL parallelism; add backpressure and chunk "
+            "the batch so processing time stays under the SLA before the load-timeout "
+            "breaks the pipeline."
+        )
     if "stall" in ft or "throughput" in ft:
         return "Check upstream producer / consumer lag; scale consumers; backfill the window."
     if "outage" in ft or "source" in ft:

@@ -85,7 +85,29 @@ def emit(tick: int, prediction: dict, decision: dict) -> None:
             annotation=annotation_id or "n/a",
         )
 
+        # Governor -> Grafana IRM: declare the incident ONCE per predicted-failure
+        # signature, carrying the AI's full analysis + remediation and links to the
+        # governed issue / gated PR. De-duped, and auto-resolved on GREEN.
+        try:
+            incident_ref = grafana_gov.open_incident(
+                prediction, decision,
+                links={"issue_url": issue_url, "pr_url": pr_url},
+            )
+        except Exception:  # noqa: BLE001 - governance must never break the loop
+            incident_ref = None
+        audit_trail.stream_emit(
+            "grafana_incident_declared",
+            level=level,
+            predicted_failure_type=prediction.get("predicted_failure_type"),
+            risk_score=prediction.get("risk_score"),
+            incident=incident_ref or "n/a",
+        )
+
 
 def clear_incident() -> None:
     config.INCIDENTS_FILE.write_text(json.dumps({"level": "GREEN"}, indent=2))
+    try:
+        grafana_gov.resolve_incidents()
+    except Exception:  # noqa: BLE001 - governance must never break the loop
+        pass
     audit_trail.audit("incident_cleared")

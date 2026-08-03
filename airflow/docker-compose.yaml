@@ -50,6 +50,9 @@ x-airflow-common: &airflow-common
     GRAFANA_URL: ${GRAFANA_INTERNAL_URL:-http://grafana:3000}
     GRAFANA_USER: ${GRAFANA_USER:-admin}
     GRAFANA_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    # --- Grafana IRM / Incident (optional real incident on the predicted failure) ---
+    GRAFANA_IRM_URL: ${GRAFANA_IRM_URL:-}
+    GRAFANA_IRM_TOKEN: ${GRAFANA_IRM_TOKEN:-}
     # --- OpenTelemetry (OTLP -> collector; optional per-cycle app telemetry) ---
     OTEL_ENABLED: ${OTEL_ENABLED:-true}
     OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
@@ -177,7 +180,12 @@ services:
 
   airflow-webserver:
     <<: *airflow-common
-    command: webserver
+    # Clear any stale gunicorn PID file left behind when this container is
+    # RESTARTED in place (host sleep/resume, Docker Desktop restart, OOM
+    # auto-restart). Without this the webserver aborts on boot with
+    # "Already running on PID … (or pid file is stale)" and the UI at :18080
+    # never comes up -- even though postgres/scheduler/kafka all recover fine.
+    command: ["bash", "-c", "rm -f /opt/airflow/airflow-webserver.pid; exec airflow webserver"]
     ports:
       - "18080:8080"
     healthcheck:
@@ -195,7 +203,9 @@ services:
 
   airflow-scheduler:
     <<: *airflow-common
-    command: scheduler
+    # Same stale-PID guard as the webserver: a restarted scheduler must never be
+    # blocked by a leftover airflow-scheduler.pid from the previous process.
+    command: ["bash", "-c", "rm -f /opt/airflow/airflow-scheduler.pid; exec airflow scheduler"]
     depends_on:
       postgres:
         condition: service_healthy

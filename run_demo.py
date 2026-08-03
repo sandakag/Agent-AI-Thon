@@ -18,6 +18,7 @@ Usage
     python run_demo.py --inject schema-drift    # predict a failure before it happens
     python run_demo.py --inject null-surge --ticks 20 --interval 4
     python run_demo.py --inject volume-drop
+    python run_demo.py --inject latency-surge    # load climbs -> latency SLA breach -> timeout
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import time
 import config
 from agent.predictive_agent import PredictiveAgent
 from alerting.notifier import clear_incident, emit
-from faults import apply_fault
+from faults import apply_fault, load_latency
 from ingestion.coinbase_source import fetch_batch
 from pipeline.etl import run_etl
 from policy.policy_engine import decide
@@ -41,7 +42,7 @@ def main() -> None:
     ap.add_argument("--interval", type=float, default=4.0, help="seconds between ticks")
     ap.add_argument(
         "--inject",
-        choices=["none", "schema-drift", "null-surge", "volume-drop"],
+        choices=["none", "schema-drift", "null-surge", "volume-drop", "latency-surge"],
         default="none",
     )
     ap.add_argument("--inject-at", type=int, default=3, help="tick to start the fault")
@@ -70,6 +71,12 @@ def main() -> None:
         raw = apply_fault(raw, args.inject, tick, inject_at=args.inject_at)
         etl = run_etl(raw)
         latency_ms = (time.time() - t0) * 1000.0
+        latency_ms, load_error = load_latency(
+            args.inject, tick, latency_ms, inject_at=args.inject_at
+        )
+        if load_error and not etl["failed"]:
+            etl["failed"] = True
+            etl["error"] = load_error
 
         signals = collector.collect(raw, etl, latency_ms)
         prediction = agent.predict(collector, args.interval)

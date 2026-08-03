@@ -33,7 +33,7 @@ python run_demo.py --inject schema-drift
 4. `data/active_incidents.json` + `audit/audit.jsonl` — the banner and the
    hash-chained trail the dashboard reads.
 
-Other faults: `--inject null-surge --ticks 20 --interval 4`, `--inject volume-drop`.
+Other faults: `--inject null-surge --ticks 20 --interval 4`, `--inject volume-drop`, `--inject latency-surge` (load climbs → latency SLA breach → timeout break; remediation is a code fix).
 
 ---
 

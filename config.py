@@ -135,7 +135,12 @@ TARDIS_MODEL = os.environ.get("TARDIS_MODEL", "chatflow")
 # the agent must PREDICT before it fires.
 NULL_RATE_CRITICAL = float(os.environ.get("NULL_RATE_CRITICAL", "0.60"))
 MIN_RECORDS = int(os.environ.get("MIN_RECORDS", "20"))          # below = starvation
-SLA_LATENCY_MS = float(os.environ.get("SLA_LATENCY_MS", "4000"))
+SLA_LATENCY_MS = float(os.environ.get("SLA_LATENCY_MS", "4000"))     # soft SLA (early warn)
+# Under sustained load the effective processing latency climbs; once it crosses
+# this HARD ceiling the load stage aborts the batch (a processing timeout) — the
+# "pipeline broke under load" incident the agent must PREDICT from the rising
+# latency trend, well before it actually fires.
+LATENCY_TIMEOUT_MS = float(os.environ.get("LATENCY_TIMEOUT_MS", "9000"))
 
 # ---------------------------------------------------------------------------
 # Risk bands used by the preventive policy engine
@@ -148,3 +153,15 @@ RISK_RED = float(os.environ.get("RISK_RED", "70"))       # imminent / firing
 # ---------------------------------------------------------------------------
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+# ---------------------------------------------------------------------------
+# Optional Grafana IRM / Incident governance (a REAL incident on the predicted
+# failure). The stack's Grafana is OSS, so the incident is ALWAYS surfaced as a
+# tagged annotation on every board (the "Guardian incidents" marker). When a
+# Grafana IRM service-account token is provided, the SAME predicted-failure
+# analysis is ALSO declared as a real incident via the Grafana Incident API.
+# ---------------------------------------------------------------------------
+GRAFANA_IRM_URL = os.environ.get("GRAFANA_IRM_URL", GRAFANA_URL)
+GRAFANA_IRM_TOKEN = os.environ.get(
+    "GRAFANA_IRM_TOKEN", os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN", "")
+)

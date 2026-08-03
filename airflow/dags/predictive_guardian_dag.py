@@ -14,6 +14,7 @@ Trigger DAG w/ config (from the Airflow UI):
     {"inject": "schema-drift"}    # ramps each run until risk crosses AMBER -> RED
     {"inject": "null-surge"}      # missing quantity -> null amounts
     {"inject": "volume-drop"}     # upstream stall / starvation
+    {"inject": "latency-surge"}   # load climbs -> latency SLA breach -> processing timeout
     {"reset": true}               # clear the ramp + banner
 """
 

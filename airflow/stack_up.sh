@@ -23,4 +23,4 @@ echo "  Kafka-UI   http://localhost:8085"
 echo "  Spark      http://localhost:8081"
 echo ""
 echo "Trigger a fault from Airflow (DAG: predictive_pipeline_guardian) with conf:"
-echo '  {"inject":"schema-drift"}   {"inject":"null-surge"}   {"inject":"volume-drop"}'
+echo '  {"inject":"schema-drift"}   {"inject":"null-surge"}   {"inject":"volume-drop"}   {"inject":"latency-surge"}'

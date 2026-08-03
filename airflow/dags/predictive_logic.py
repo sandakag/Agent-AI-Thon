@@ -16,6 +16,7 @@ Fault injection from the Airflow UI — *Trigger DAG w/ config*:
     {"inject": "schema-drift"}    # upstream renames price -> px   (ramps each run)
     {"inject": "null-surge"}      # missing size -> null amounts    (ramps each run)
     {"inject": "volume-drop"}     # upstream stall / starvation     (ramps each run)
+    {"inject": "latency-surge"}   # load climbs -> latency SLA breach -> timeout (ramps)
     {"reset": true}               # clear the ramp + incident banner
 """
 
@@ -29,7 +30,7 @@ import config
 from agent import audit_trail
 from agent.predictive_agent import PredictiveAgent
 from alerting.notifier import clear_incident, emit
-from faults import apply_fault
+from faults import apply_fault, load_latency
 from pipeline import kafka_io
 from pipeline.etl import run_etl
 from policy.policy_engine import decide
@@ -107,6 +108,15 @@ def do_transform_load(raw: list[dict], run_id: str) -> dict:
     etl = run_etl(raw)
     latency_ms = (time.time() - t0) * 1000.0
 
+    state = _load_state()
+    # Load-induced latency + hard processing-timeout break (latency-surge mode).
+    latency_ms, load_error = load_latency(
+        str(state.get("mode", "none")), int(state.get("tick", 0)), latency_ms, inject_at=1
+    )
+    if load_error and not etl["failed"]:
+        etl["failed"] = True
+        etl["error"] = load_error
+
     if not etl["failed"]:
         rows = [
             {"product": p, "total": v, "run_date": None}
@@ -117,7 +127,6 @@ def do_transform_load(raw: list[dict], run_id: str) -> dict:
         except Exception:  # noqa: BLE001 - transport hiccup must not fail the ETL task
             pass
 
-    state = _load_state()
     history = _load_history()
     collector = _collector_from_history(history, state.get("baseline_schema"))
     sig = collector.collect(raw, etl, latency_ms)

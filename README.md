@@ -50,6 +50,7 @@ python run_demo.py                                   # healthy live data — sta
 python run_demo.py --inject schema-drift             # agent flags risk BEFORE the ETL breaks
 python run_demo.py --inject null-surge --ticks 20 --interval 4
 python run_demo.py --inject volume-drop
+python run_demo.py --inject latency-surge            # load climbs → latency SLA breach → timeout break
 ```
 
 The run ends by printing the **LEAD TIME** between the first warning and the
@@ -163,6 +164,7 @@ real dependency that degrades over time. In the Airflow UI:
 {"inject": "schema-drift"}    // upstream renames  price → px   (schema drift)
 {"inject": "null-surge"}      // upstream drops the size field  → NULL revenue
 {"inject": "volume-drop"}     // upstream stalls / starves the batch
+{"inject": "latency-surge"}   // load climbs → latency SLA breach → processing timeout
 {"reset": true}               // clear the ramp + incident banner
 {}                            // healthy live data → stays GREEN
 ```
@@ -179,12 +181,13 @@ ETL is *still succeeding*. That gap is the headline metric: **lead time**.
 | `extract_trades` | Live batch pulled, ramping fault applied | Airflow log: `mode`, `tick` |
 | `transform_load` | ETL runs; health signals computed (null-rate, schema-hash drift, volume, latency) and persisted to a rolling window | ETL/Pipeline Grafana board; `etl_run` audit event |
 | `predict_risk` | The **AI brain** forecasts `risk_score`, `confidence`, `lead_time_minutes`, `predicted_failure_type` and **evidence** (the contributing signals) | AI/Agent Grafana board; `agent_reason` audit event |
-| `govern` | Policy grades GREEN/AMBER/RED → raises the early warning → **opens a REAL GitHub issue (AMBER+)** and stages a **gated preventive PR (RED)** → drops a **Grafana annotation** + fires the **alert** | Grafana annotation + alert; `prediction` audit event; GitHub |
+| `govern` | Policy grades GREEN/AMBER/RED → raises the early warning → **opens a REAL GitHub issue (AMBER+)** and stages a **gated preventive PR (RED)** → **declares a Grafana incident** (a tagged annotation on every board + a real **Grafana IRM incident** when `GRAFANA_IRM_TOKEN` is set) + fires the **alert** | Grafana incident + annotation + alert; `prediction` / `grafana_incident_opened` audit events; GitHub |
 
 **The "root-cause / explanation" (Explainable Risk Insights):** the prediction
 carries an `evidence` list (e.g. *"schema hash changed vs baseline; `price`
 column missing; null-rate 0.0 → rising"*), a `predicted_failure_type`
-(`schema_drift` / `data_quality` / `starvation`), and a `recommendation`. That
+(`schema_drift` / `data_quality` / `starvation` / `latency-degradation`), and a
+`recommendation`. That
 same evidence is written verbatim into the GitHub **issue body** and the
 preventive **PR runbook** — so the stated driver is traceable straight back to
 the measured signal, which is exactly what the SMEs spot-check.
@@ -203,6 +206,11 @@ show the breadth — reset between runs for a clean lead-time story:
 
 // 3. Volume drop / starvation — upstream stalls, batch runs thin
 {"inject": "volume-drop"}    ×4      then   {"reset": true}
+
+// 4. Latency / load surge — load climbs, processing latency breaches the SLA,
+//    then a hard timeout BREAKS the pipeline. The remediation is a CODE change
+//    (scale consumers + backpressure + batch chunking) staged in the PR runbook.
+{"inject": "latency-surge"}  ×6      then   {"reset": true}
 ```
 
 For each: point at the **AMBER tick** (agent warned) → the later **RED tick**
@@ -217,7 +225,7 @@ number directly on the host path.
 | **Pipeline Health Monitoring** | Consolidated health view (dashboard + 4 Grafana boards): executions, latency, throughput, null-rate, schema-hash, volume, SLA-style signals |
 | **Predictive Failure Detection** | Risk score + confidence + lead time per tick, ramping across runs, flagged **before** the ETL fails |
 | **Explainable Risk Insights** | `evidence` list + `predicted_failure_type` correlated from logs/quality/latency, echoed into the issue & PR — traceable to the raw signal |
-| **Preventive Actions** *(extension)* | Real predicted-incident **GitHub issue** (AMBER+) and a **gated preventive PR** with a runbook (RED) — AI does the legwork, a human approves the merge |
+| **Preventive Actions** *(extension)* | Real predicted-incident **GitHub issue** (AMBER+), a **gated preventive PR** with a runbook (RED), and a **Grafana incident** (IRM + tagged annotation) carrying the same RCA + remediation — AI does the legwork, a human approves the merge |
 
 | Success metric (judging) | How to show it |
 |---|---|
@@ -270,6 +278,11 @@ When `GITHUB_TOKEN` + `GITHUB_REPOSITORY` are set (see `.env.example`):
 - **RED** → pushes a branch `guardian/prevent-<sig>`, commits a prevention
   runbook, and opens a **gated Pull Request** against the default branch. It is
   **never auto-merged** — a human approves. Also de-duplicated per signature.
+- **AMBER+** → also **declares a Grafana incident** carrying the same AI analysis
+  (RCA evidence + code remediation + links to the issue / PR): a tagged
+  annotation on every dashboard (the OSS-Grafana marker), plus a real **Grafana
+  IRM incident** when `GRAFANA_IRM_TOKEN` is set. De-duplicated per signature and
+  **auto-resolved** when the pipeline returns to GREEN.
 
 With no token it degrades to a printed, fully-audited plan — nothing silently
 fails.
