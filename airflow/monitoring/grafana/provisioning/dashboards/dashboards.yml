@@ -1,0 +1,14 @@
+# Tell Grafana to load any dashboard JSON dropped into /var/lib/grafana/dashboards.
+apiVersion: 1
+
+providers:
+  - name: predictive-guardian
+    orgId: 1
+    folder: Predictive Guardian
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 15
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

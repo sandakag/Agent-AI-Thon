@@ -1,0 +1,20 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Predictive Pipeline Guardian — dependencies
+#
+# The CORE predictive loop (run_demo.py, the agent, ETL, signals, governance,
+# audit trail and the live dashboard) runs on the Python STANDARD LIBRARY ONLY
+# (urllib / json / statistics / http.server). You can run the whole demo on the
+# host with zero installs.
+#
+# The extras below are only needed for the FULL Docker data plane (they are
+# already baked into airflow/Dockerfile). The code degrades gracefully — if
+# Kafka/Spark are missing it falls back to the direct Coinbase pull.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --- Real streaming data plane (used inside the Docker stack) ---
+kafka-python-ng==2.2.3        # Kafka producer/consumer (pipeline/kafka_io.py)
+pyspark==3.5.1                # Spark aggregation (best-effort; ETL runs without it too)
+
+# --- Optional ML grounding for the vector memory (safe to omit) ---
+# numpy>=1.26
+# scikit-learn>=1.3

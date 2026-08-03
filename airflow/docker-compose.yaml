@@ -1,0 +1,293 @@
+# Real Apache stack for the Predictive Pipeline Guardian demo.
+#
+# ISOLATED project: this stack runs under its OWN compose project name
+# (`agent-aithon`) with its OWN host ports and volumes, completely separate from
+# the itsm-self-heal-ai stack (project `airflow`). The two never share
+# containers, networks or volumes. Do NOT remove the `name:` key below.
+#
+#   Airflow (LocalExecutor + Postgres) | Kafka 3.7 (KRaft) | Spark 3.5.1 | Kafka-UI
+#   Prometheus + Grafana + Loki + Promtail | live dashboard | Coinbase stream tap
+#
+# Launch:  docker compose --env-file ../.env --profile full up -d --build
+# UIs:     Airflow    http://localhost:18080  (admin/admin)
+#          Dashboard  http://localhost:18089  (no login)
+#          Kafka-UI   http://localhost:18085
+#          Spark      http://localhost:18081
+#          Grafana    http://localhost:13001  (no login — anonymous Admin)
+#          Prometheus http://localhost:19090
+---
+name: agent-aithon
+x-airflow-common: &airflow-common
+  build:
+    context: ..
+    dockerfile: airflow/Dockerfile
+  image: predictive-guardian-airflow:2.10.5
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__WEBSERVER__WORKERS: "2"
+    AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "600"
+    AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "600"
+    PYTHONPATH: /opt/airflow/project
+    ETL_PROJECT_ROOT: /opt/airflow/project
+    # --- real data plane wiring ---
+    KAFKA_BOOTSTRAP: kafka:29092
+    KAFKA_TOPIC_RAW: trades-raw
+    KAFKA_TOPIC_AGG: trades-aggregated
+    SPARK_MASTER: local[*]
+    JAVA_HOME: /usr/lib/jvm/default-java
+    # --- AI brain selection (Copilot runs on the host; in-cluster falls back to
+    #     the transparent heuristic, or set BRAIN=tardis for the prod brain) ---
+    BRAIN: ${BRAIN:-auto}
+    GUARDIAN_TICK_SECONDS: "600"
+    # --- GitHub governance (real predicted-incident issue + gated PR) ---
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
+    # --- Grafana (in-network address) ---
+    GRAFANA_URL: ${GRAFANA_INTERNAL_URL:-http://grafana:3000}
+    GRAFANA_USER: ${GRAFANA_USER:-admin}
+    GRAFANA_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    # --- OpenTelemetry (OTLP -> collector; optional per-cycle app telemetry) ---
+    OTEL_ENABLED: ${OTEL_ENABLED:-true}
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+    OTEL_SERVICE_NAME: predictive-guardian
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ..:/opt/airflow/project
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    volumes:
+      - postgres-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    restart: always
+
+  kafka:
+    image: apache/kafka:3.7.0
+    profiles: ["full"]
+    ports:
+      - "19092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:19092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    profiles: ["full"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic trades-raw --partitions 1 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic trades-aggregated --partitions 1 --replication-factor 1
+        echo "topics ready"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    profiles: ["full"]
+    ports:
+      - "18085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  spark-master:
+    image: apache/spark:3.5.1
+    profiles: ["full"]
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "18081:8080"
+      - "17077:7077"
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    profiles: ["full"]
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    depends_on:
+      - spark-master
+
+  # --- Always-on live tap: real Coinbase trades -> Kafka every cycle, so the
+  #     pipeline is visibly alive in Kafka-UI and Grafana in real time. ---
+  stream-generator:
+    <<: *airflow-common
+    profiles: ["full"]
+    command: ["python", "/opt/airflow/project/airflow/stream_generator.py"]
+    environment:
+      <<: *airflow-common-env
+      STREAM_INTERVAL_SECONDS: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin \
+          --firstname admin --lastname admin --role Admin --email admin@example.com || true
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  dashboard:
+    <<: *airflow-common
+    command: ["python", "-m", "dashboard"]
+    environment:
+      <<: *airflow-common-env
+      DASHBOARD_PORT: "8089"
+    ports:
+      - "18089:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  # --- OpenTelemetry Collector: scrapes the guardian /metrics, accepts OTLP
+  #     from the Python components, and exposes its own health/throughput so the
+  #     OpenTelemetry service itself can be monitored in Grafana. ---
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./monitoring/otel/guardian-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "14317:4317"   # OTLP gRPC
+      - "14318:4318"   # OTLP HTTP
+      - "18888:8888"   # collector internal telemetry (Prometheus scrapes this)
+    depends_on:
+      - dashboard
+    restart: always
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    ports:
+      - "19090:9090"
+    depends_on:
+      - dashboard
+    restart: always
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_DISABLE_BRUTE_FORCE_LOGIN_PROTECTION: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_ANONYMOUS_ORG_NAME: "Main Org."
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "13001:3000"
+    depends_on:
+      - prometheus
+    restart: always
+
+  loki:
+    image: grafana/loki:3.1.1
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./monitoring/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "13100:3100"
+    restart: always
+
+  promtail:
+    image: grafana/promtail:3.1.1
+    command: ["-config.file=/etc/promtail/promtail-config.yaml"]
+    volumes:
+      - ./monitoring/promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      - ../audit:/audit:ro
+    depends_on:
+      - loki
+    restart: always
+
+volumes:
+  postgres-db:
+  prometheus-data:
+  grafana-data:
+  loki-data:

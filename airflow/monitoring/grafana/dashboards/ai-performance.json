@@ -1,0 +1,129 @@
+{
+  "annotations": { "list": [
+    { "name": "Guardian incidents", "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+      "enable": true, "hide": false, "iconColor": "red",
+      "target": { "type": "tags", "matchAny": true, "tags": ["guardian"], "limit": 100 } }
+  ] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "liveNow": true,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["predictive-guardian", "ai"],
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Guardian — AI / Agent Performance",
+  "uid": "guardian-ai",
+  "version": 1,
+  "weekStart": "",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1, "type": "gauge", "title": "Latest risk score",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "min": 0, "max": 100, "unit": "none",
+        "thresholds": { "mode": "absolute", "steps": [
+          { "color": "green", "value": null }, { "color": "orange", "value": 40 }, { "color": "red", "value": 70 } ] } }, "overrides": [] },
+      "options": { "showThresholdLabels": false, "showThresholdMarkers": true },
+      "targets": [ { "refId": "A", "expr": "guardian_risk_score", "datasource": { "type": "prometheus", "uid": "prometheus" } } ]
+    },
+    {
+      "id": 2, "type": "gauge", "title": "Prediction confidence",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "unit": "percentunit",
+        "thresholds": { "mode": "absolute", "steps": [
+          { "color": "red", "value": null }, { "color": "orange", "value": 0.5 }, { "color": "green", "value": 0.75 } ] } }, "overrides": [] },
+      "options": { "showThresholdLabels": false, "showThresholdMarkers": true },
+      "targets": [ { "refId": "A", "expr": "guardian_confidence", "datasource": { "type": "prometheus", "uid": "prometheus" } } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "AI brain",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "none", "mappings": [
+        { "type": "value", "options": { "0": { "text": "HEURISTIC (fallback)", "color": "orange" }, "1": { "text": "AI ONLINE", "color": "green" } } } ],
+        "color": { "mode": "thresholds" },
+        "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null }, { "color": "green", "value": 1 } ] } }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "guardian_brain_available", "datasource": { "type": "prometheus", "uid": "prometheus" } } ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Predicted lead time",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "m", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "guardian_lead_time_minutes", "datasource": { "type": "prometheus", "uid": "prometheus" } } ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Risk score over time (AMBER 40 / RED 70)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "fieldConfig": { "defaults": { "min": 0, "max": 100, "unit": "none",
+        "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "spanNulls": true, "gradientMode": "opacity", "thresholdsStyle": { "mode": "line" } },
+        "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 40 }, { "color": "red", "value": 70 } ] } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "guardian_risk_score", "legendFormat": "risk", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "B", "expr": "guardian_pipeline_health", "legendFormat": "health", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Prediction & early-warning rate (per 5m)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "short",
+        "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "spanNulls": true } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "rate(guardian_predictions_total[5m])", "legendFormat": "predictions/s", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "refId": "B", "expr": "rate(guardian_warnings_total[5m])", "legendFormat": "warnings/s", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 7, "type": "stat", "title": "LLM-reasoned predictions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "fixed", "fixedColor": "purple" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "guardian_llm_predictions_total", "datasource": { "type": "prometheus", "uid": "prometheus" } } ]
+    },
+    {
+      "id": 8, "type": "stat", "title": "Heuristic predictions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "guardian_heuristic_predictions_total", "datasource": { "type": "prometheus", "uid": "prometheus" } } ]
+    },
+    {
+      "id": 9, "type": "stat", "title": "Predicted-incident issues",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "fixed", "fixedColor": "purple" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "guardian_issues_opened_total", "datasource": { "type": "prometheus", "uid": "prometheus" } } ]
+    },
+    {
+      "id": 10, "type": "stat", "title": "Gated preventive PRs",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "refId": "A", "expr": "guardian_prs_opened_total", "datasource": { "type": "prometheus", "uid": "prometheus" } } ]
+    },
+    {
+      "id": 11, "type": "logs", "title": "Real-time AI reasoning & governance stream",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 11, "w": 24, "x": 0, "y": 20 },
+      "options": { "showTime": true, "showLabels": false, "showCommonLabels": false, "wrapLogMessage": true, "prettifyLogMessage": true, "enableLogDetails": true, "dedupStrategy": "none", "sortOrder": "Descending" },
+      "targets": [ { "refId": "A", "datasource": { "type": "loki", "uid": "loki" },
+        "expr": "{service=\"predictive-guardian\", event=~\"prediction|agent_reason|governance_issue_opened|governance_pr_opened|grafana_alert_raised\"}", "queryType": "range" } ]
+    }
+  ]
+}

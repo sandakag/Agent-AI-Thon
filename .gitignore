@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+data/
+audit/
+
+# Airflow runtime artifacts (transient — never commit)
+airflow/logs/
+airflow/plugins/__pycache__/
+*.log
+
+# Local state
+*.pid
+.DS_Store

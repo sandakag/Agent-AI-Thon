@@ -1,0 +1,194 @@
+# Auto-provisioned Grafana alert rules for the Predictive Guardian.
+#
+# These fire AUTOMATICALLY off the guardian metrics Prometheus scrapes from the
+# dashboard /metrics endpoint. The instant the predictive agent's risk crosses
+# a band (the governor is acting at the same moment), Grafana raises the alert
+# in Alerting -> Active, colours the panels, and notifies the webhook contact
+# point. No human wiring needed — the incident "opens itself" in Grafana.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: guardian-alerts
+    folder: Predictive Guardian
+    interval: 30s
+    rules:
+      # ---- RED: imminent predicted incident (risk >= 70) ----
+      - uid: guardian_red_incident
+        title: Predicted pipeline incident (RED)
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: critical
+          service: predictive-guardian
+        annotations:
+          summary: "RED — predicted pipeline failure, risk >= 70/100. Governor raised the incident and staged a gated preventive PR."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: guardian_risk_score
+              instant: true
+              editorMode: code
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [70, 0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+
+      # ---- AMBER: early warning (risk >= 40) ----
+      - uid: guardian_amber_warning
+        title: Early warning — rising failure risk (AMBER)
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: warning
+          service: predictive-guardian
+        annotations:
+          summary: "AMBER — failure risk >= 40/100 with lead time remaining. Governor opened a predicted-incident issue."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: guardian_risk_score
+              instant: true
+              editorMode: code
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [40, 0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+
+      # ---- Pipeline health degraded (< 50) ----
+      - uid: guardian_pipeline_health_low
+        title: Pipeline health degraded
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: warning
+          service: predictive-guardian
+        annotations:
+          summary: "Pipeline health dropped below 50/100 — data quality is degrading."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: guardian_pipeline_health
+              instant: true
+              editorMode: code
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: lt, params: [50, 0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+
+      # ---- ETL failure actually observed in the last 5 min ----
+      - uid: guardian_etl_failure
+        title: ETL failure observed
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: critical
+          service: predictive-guardian
+        annotations:
+          summary: "An ETL run failed — the predicted incident has materialised in the pipeline."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: increase(guardian_etl_failures_total[5m])
+              instant: true
+              editorMode: code
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: gt, params: [0, 0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+
+      # ---- Tamper-evident audit chain broken ----
+      - uid: guardian_audit_broken
+        title: Audit hash-chain broken
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: critical
+          service: predictive-guardian
+        annotations:
+          summary: "The tamper-evident audit chain failed verification — governance integrity at risk."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: guardian_audit_intact
+              instant: true
+              editorMode: code
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator: { type: lt, params: [1, 0] }
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }

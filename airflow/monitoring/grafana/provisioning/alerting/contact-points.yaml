@@ -1,0 +1,26 @@
+# Auto-provisioned Grafana contact point + notification policy.
+#
+# When any guardian alert rule fires, Grafana POSTs the alert to the live
+# dashboard's /alert webhook. The dashboard logs it to the stream telemetry
+# (Promtail -> Loki), so a raised Grafana alert ALSO shows up in the real-time
+# log panels — the alert, the metric spike and the logs all line up.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: guardian-webhook
+    receivers:
+      - uid: guardian_webhook_1
+        type: webhook
+        settings:
+          url: http://dashboard:8089/alert
+          httpMethod: POST
+        disableResolveMessage: false
+
+policies:
+  - orgId: 1
+    receiver: guardian-webhook
+    group_by: ["grafana_folder", "alertname"]
+    group_wait: 5s
+    group_interval: 30s
+    repeat_interval: 1h

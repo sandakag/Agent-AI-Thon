@@ -1,0 +1,47 @@
+# Promtail tails the tamper-evident audit trail (audit/audit.jsonl) and the
+# lock-free live heartbeat (audit/stream.jsonl) and ships every event to Loki.
+# Each line is already JSON, so we parse it and promote the most useful fields
+# to labels for filtering the predict -> warn -> govern story in Grafana.
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: guardian-audit
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: guardian-audit
+          service: predictive-guardian
+          __path__: /audit/audit.jsonl
+      - targets: [localhost]
+        labels:
+          job: guardian-audit
+          service: predictive-guardian
+          __path__: /audit/stream.jsonl
+    pipeline_stages:
+      - json:
+          expressions:
+            ts: ts
+            event: event
+            level: level
+            source: source
+            predicted_failure_type: predicted_failure_type
+            risk_score: risk_score
+            signature: signature
+      - labels:
+          event:
+          level:
+          source:
+      - timestamp:
+          source: ts
+          format: RFC3339Nano
+          fallback_formats:
+            - RFC3339
