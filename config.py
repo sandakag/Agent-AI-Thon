@@ -110,7 +110,18 @@ BRAIN = os.environ.get("BRAIN", "auto")
 # GitHub Copilot CLI brain (demo). The executable is auto-discovered (the VS Code
 # Copilot shim, or a copilot on PATH); override only if it lives somewhere unusual.
 COPILOT_CLI_PATH = os.environ.get("COPILOT_CLI_PATH", "")
-COPILOT_CLI_MODEL = os.environ.get("COPILOT_CLI_MODEL", "cli")  # label for the audit trail
+# Preferred model the brain requests via `copilot --model`. Use "auto" to let
+# Copilot pick the best model your seat allows (works on every plan and keeps the
+# demo fast). Set a specific id -- e.g. "claude-opus-4.8" -- to force a bigger
+# model, but note the premium models (Opus / Sonnet / GPT-5.x / Gemini Pro)
+# require a Copilot Pro+/Business/Enterprise/Max seat. If the preferred model is
+# not on your seat, the brain logs a warning and falls back to
+# COPILOT_CLI_FALLBACK_MODEL, so the agent never breaks.
+COPILOT_CLI_MODEL = os.environ.get("COPILOT_CLI_MODEL", "auto")
+COPILOT_CLI_FALLBACK_MODEL = os.environ.get("COPILOT_CLI_FALLBACK_MODEL", "auto")
+# Optional reasoning depth for richer, more detailed answers. One of:
+# none | minimal | low | medium | high | xhigh | max. Empty = model default.
+COPILOT_CLI_REASONING_EFFORT = os.environ.get("COPILOT_CLI_REASONING_EFFORT", "")
 COPILOT_CLI_TIMEOUT_SECONDS = int(os.environ.get("COPILOT_CLI_TIMEOUT_SECONDS", "120"))
 
 # Tardis / Chatflow brain (production seam).
