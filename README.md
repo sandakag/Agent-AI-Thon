@@ -51,6 +51,10 @@ python run_demo.py --inject schema-drift             # agent flags risk BEFORE t
 python run_demo.py --inject null-surge --ticks 20 --interval 4
 python run_demo.py --inject volume-drop
 python run_demo.py --inject latency-surge            # load climbs → latency SLA breach → timeout break
+
+# author your OWN incident the AI has never seen — any data mutation you choose:
+python run_demo.py --inject custom --incident '{"label":"price outlier","ops":[{"op":"scale_field","field":"price","factor":40}]}'
+python run_demo.py --inject custom --incident-file my_incident.json --ticks 20
 ```
 
 The run ends by printing the **LEAD TIME** between the first warning and the
@@ -165,6 +169,7 @@ real dependency that degrades over time. In the Airflow UI:
 {"inject": "null-surge"}      // upstream drops the size field  → NULL revenue
 {"inject": "volume-drop"}     // upstream stalls / starves the batch
 {"inject": "latency-surge"}   // load climbs → latency SLA breach → processing timeout
+{"inject": "custom", "label": "price outlier", "ops": [{"op": "scale_field", "field": "price", "factor": 40}]}  // YOUR own incident
 {"reset": true}               // clear the ramp + incident banner
 {}                            // healthy live data → stays GREEN
 ```
@@ -248,6 +253,62 @@ number directly on the host path.
 > `guardian_audit_intact` metric → Grafana alert) flips to broken. Nothing the
 > agent claims can be silently rewritten.
 
+### F) Author your OWN incident — the AI has never seen it
+
+> **The honest-skeptic test.** *“You injected a failure you also wrote the
+> detector for — of course it catches it.”* So let the **audience invent the
+> incident at runtime.** There is **no dedicated detector** for what they type;
+> a **generic multi-signal anomaly scan** (robust median/MAD z-score on *every*
+> health signal) notices any signal leaving its normal range and hands it to the
+> **Copilot brain**, which names the likely failure, its lead time and the fix —
+> exactly like a human on-call seeing something new. The agent **behaves
+> differently per incident** because the reasoning is driven by the *measured*
+> signals, not a hard-coded branch.
+
+Three ways to induce one — each lands in the **next live tick**, and the agent is
+never told what you did:
+
+- **Dashboard** (http://localhost:18089) → the **“🧪 Induce your OWN incident”**
+  panel → click a quick button (*Null size, Rename price, Price ×50, Freeze
+  price, Shrink batch, Dup storm, Add latency*) **or** paste an `ops` JSON array.
+- **Host:** `python run_demo.py --inject custom --incident '{...}'` (or
+  `--incident-file my_incident.json`).
+- **Airflow:** trigger the DAG with `{"inject":"custom","label":"…","ops":[ … ]}`.
+
+An incident is just a list of **data mutations** (pure data-plane — no code is
+ever `eval`-ed, so it is safe to hand the keyboard to a stranger):
+
+| `op` | Effect on the live batch |
+|---|---|
+| `null_field` / `drop_field` | blank out / remove a field → parse failure / schema drift |
+| `rename_field` (`to`) | rename a field → downstream schema drift |
+| `scale_field` (`factor`) / `constant_field` (`value`) | outlier / frozen values → revenue anomaly |
+| `freeze_field` | stop a field moving → stale-feed anomaly |
+| `corrupt_type` (`value`) | wrong data type → parse failure |
+| `shrink_batch` / `duplicate` | volume collapse / duplicate storm |
+| `latency` (`ms`) | inject processing latency → SLA breach |
+
+Example `my_incident.json`:
+
+```json
+{"label": "vendor sent prices in cents", "ops": [{"op": "scale_field", "field": "price", "factor": 100}]}
+```
+
+Roll it forward a few ticks and watch risk climb **GREEN → AMBER** with a
+`predicted_failure_type` of `emerging anomaly (revenue deviating)` — a failure
+class **nobody hard-coded**, caught and explained before it breaks.
+
+### G) Ask the Guardian — the chat box
+
+The dashboard's **“💬 Ask the Guardian”** panel is a chat box wired to the same
+**GitHub Copilot brain**, grounded on the *live* telemetry (latest prediction,
+signals, banner, recent failure types). Ask in plain English — *“what’s the
+biggest risk right now and when will it break?”*, *“why is revenue anomalous?”*,
+*“what should I do?”* — and it answers from the measured state, forward-looking
+and concrete, and says so plainly when the data doesn’t support an answer. With
+the brain offline it degrades to a grounded summary of the current prediction,
+so the box never invents numbers.
+
 ---
 
 
@@ -304,8 +365,8 @@ fails.
 | `policy/policy_engine.py` | GREEN / AMBER / RED decision |
 | `governance/github_gov.py` | **Real** predicted-incident issue + gated preventive PR |
 | `alerting/notifier.py` | Early warning → audit → governance → incident banner |
-| `dashboard.py` | Live red/amber/green monitor + Prometheus `/metrics` |
-| `faults.py` | Demo fault injection (ramping) |
+| `dashboard.py` | Live red/amber/green monitor + Prometheus `/metrics` + Ask-the-Guardian chat + custom-incident injector |
+| `faults.py` | Demo fault injection (ramping) + open-ended custom-incident engine (author your own) |
 | `run_demo.py` | End-to-end host runner + lead-time report |
 | `airflow/dags/predictive_guardian_dag.py` | The Airflow DAG (extract → load → predict → govern) |
 | `airflow/stream_generator.py` | Always-on Coinbase → Kafka tap |

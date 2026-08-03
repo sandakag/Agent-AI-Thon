@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
 from agent import audit_trail
+from agent.brain import make_brain, BrainError
 
 
 def build_summary() -> dict:
@@ -140,6 +141,139 @@ def _record_grafana_alert(payload: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Chat box + open-ended incident injection (audience self-service)
+# ---------------------------------------------------------------------------
+CHAT_LOG = config.DATA_DIR / "chat_log.json"
+PENDING_INCIDENT = config.DATA_DIR / "pending_incident.json"
+
+_CHAT_SYSTEM = (
+    "You are the assistant for a Predictive Pipeline Guardian — an AI SRE that "
+    "PREDICTS data-pipeline failures BEFORE they happen. Answer the operator's "
+    "question about the LIVE pipeline using ONLY the telemetry provided. Be "
+    "concise, concrete and forward-looking: what is likely to break, WHEN (lead "
+    "time), WHY (which signals), and how to PREVENT it. If the telemetry does not "
+    "support an answer, say so plainly. Never invent numbers."
+)
+
+_brain = None
+
+
+def _get_brain():
+    global _brain
+    if _brain is None:
+        try:
+            _brain = make_brain()
+        except Exception:  # noqa: BLE001
+            _brain = False  # sentinel: tried and failed
+    return _brain or None
+
+
+def _chat_load() -> list:
+    if CHAT_LOG.exists():
+        try:
+            return json.loads(CHAT_LOG.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def _chat_save(turns: list) -> None:
+    try:
+        CHAT_LOG.write_text(json.dumps(turns[-20:], indent=2, default=str), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _chat_context() -> dict:
+    s = build_summary()
+    signals = {}
+    if config.SIGNAL_HISTORY_FILE.exists():
+        try:
+            hist = json.loads(config.SIGNAL_HISTORY_FILE.read_text(encoding="utf-8"))
+            if hist:
+                signals = hist[-1]
+        except (json.JSONDecodeError, OSError):
+            pass
+    last = s.get("last") or {}
+    return {
+        "banner_level": (s.get("banner") or {}).get("level"),
+        "latest_prediction": {
+            "risk_score": last.get("risk_score"),
+            "pipeline_health": last.get("pipeline_health"),
+            "predicted_failure_type": last.get("predicted_failure_type"),
+            "lead_time_minutes": last.get("lead_time_minutes"),
+            "confidence": last.get("confidence"),
+            "evidence": last.get("evidence"),
+            "recommended_action": last.get("recommended_action"),
+            "brain": last.get("source"),
+        },
+        "latest_signals": signals,
+        "recent_failure_types": [p.get("predicted_failure_type")
+                                 for p in s.get("recent_predictions", [])][:8],
+        "totals": s.get("totals"),
+        "audit_intact": (s.get("audit") or {}).get("intact"),
+    }
+
+
+def _fallback_answer(ctx: dict) -> str:
+    p = ctx.get("latest_prediction") or {}
+    lvl = ctx.get("banner_level") or "GREEN"
+    parts = [f"[grounded answer — AI brain offline] Status {lvl}, risk "
+             f"{p.get('risk_score')}/100."]
+    ft = p.get("predicted_failure_type")
+    if ft and ft != "none":
+        parts.append(f"Predicted failure: {ft} (~{p.get('lead_time_minutes')} min lead).")
+    ev = p.get("evidence") or []
+    if ev:
+        parts.append("Why: " + "; ".join(str(e) for e in ev[:3]) + ".")
+    if p.get("recommended_action"):
+        parts.append(f"Prevention: {p['recommended_action']}")
+    if lvl == "GREEN":
+        parts.append("Nothing is failing now; the guardian is watching the trends.")
+    return " ".join(parts)
+
+
+def _answer_question(q: str) -> str:
+    q = (q or "").strip()[:500]
+    if not q:
+        return "Ask about the pipeline's risk, what's likely to fail, when, or why."
+    ctx = _chat_context()
+    brain = _get_brain()
+    if brain is not None and getattr(brain, "available", False):
+        user = (f"Operator question: {q}\n\nLive telemetry (JSON):\n"
+                f"{json.dumps(ctx, default=str)}")
+        try:
+            reply = brain.chat(_CHAT_SYSTEM, user).strip()
+            return reply or _fallback_answer(ctx)
+        except BrainError:
+            return _fallback_answer(ctx)
+        except Exception:  # noqa: BLE001 - a chat hiccup must never crash the dashboard
+            return _fallback_answer(ctx)
+    return _fallback_answer(ctx)
+
+
+def _write_pending_incident(payload: dict) -> dict:
+    if payload.get("reset"):
+        try:
+            PENDING_INCIDENT.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {"status": "cleared"}
+    ops = payload.get("ops")
+    if not isinstance(ops, list) or not ops:
+        return {"status": "error", "detail": "need a non-empty 'ops' list"}
+    spec = {"label": str(payload.get("label") or "custom incident")[:80],
+            "ops": [op for op in ops if isinstance(op, dict)][:20]}
+    if not spec["ops"]:
+        return {"status": "error", "detail": "ops must be objects"}
+    try:
+        PENDING_INCIDENT.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+    except OSError as exc:
+        return {"status": "error", "detail": str(exc)}
+    return {"status": "queued", "label": spec["label"], "ops": len(spec["ops"])}
+
+
+# ---------------------------------------------------------------------------
 # Prometheus exposition
 # ---------------------------------------------------------------------------
 def render_metrics() -> str:
@@ -204,6 +338,40 @@ def _esc(x: object) -> str:
 _COLOR = {"GREEN": "#1f9d55", "AMBER": "#d98c00", "RED": "#c0392b"}
 
 
+_INJECT_BUTTONS = (
+    '<button class="alt" onclick=\'induce({label:"null the size field",ops:[{op:"null_field",field:"size"}]})\'>Null size</button>'
+    '<button class="alt" onclick=\'induce({label:"rename price to px",ops:[{op:"rename_field",field:"price",to:"px"}]})\'>Rename price</button>'
+    '<button class="alt" onclick=\'induce({label:"price outlier spike",ops:[{op:"scale_field",field:"price",factor:50}]})\'>Price x50</button>'
+    '<button class="alt" onclick=\'induce({label:"freeze price (stale feed)",ops:[{op:"freeze_field",field:"price"}]})\'>Freeze price</button>'
+    '<button class="alt" onclick=\'induce({label:"volume collapse",ops:[{op:"shrink_batch"}]})\'>Shrink batch</button>'
+    '<button class="alt" onclick=\'induce({label:"duplicate storm",ops:[{op:"duplicate"}]})\'>Dup storm</button>'
+    '<button class="alt" onclick=\'induce({label:"load latency",ops:[{op:"latency",ms:1500}]})\'>Add latency</button>'
+    '<button class="alt" onclick=\'induce({reset:true})\'>Clear</button>'
+)
+
+_SCRIPT = """
+<script>
+async function askGuardian(){
+  var el=document.getElementById('gq'); var q=(el.value||'').trim(); if(!q){return;}
+  var b=document.getElementById('gqbtn'); b.disabled=true; b.textContent='Thinking…';
+  try{await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:q})});}catch(e){}
+  location.reload();
+}
+async function induce(spec){
+  try{await fetch('/inject',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(spec)});}catch(e){}
+  location.reload();
+}
+function induceCustom(){
+  var label=(document.getElementById('inclabel').value||'custom incident');
+  var raw=(document.getElementById('incops').value||'').trim();
+  if(!raw){alert('paste an ops JSON array, or use the quick buttons');return;}
+  var ops; try{ops=JSON.parse(raw);}catch(e){alert('ops must be a valid JSON array');return;}
+  induce({label:label,ops:ops});
+}
+</script>
+"""
+
+
 def render_html() -> str:
     s = build_summary()
     t = s["totals"]
@@ -261,6 +429,34 @@ def render_html() -> str:
     chain = ('<span class="ok">✓ INTACT</span>' if a["intact"]
              else f'<span class="bad">✗ BROKEN at #{a["broken_at"]}</span>')
 
+    chat_rows = ""
+    for tn in _chat_load()[-6:]:
+        chat_rows += (f'<div class="qa"><div class="q">🧑 {_esc(tn.get("q", ""))}</div>'
+                      f'<div class="a">🤖 {_esc(tn.get("a", ""))}</div></div>')
+    chat_rows = chat_rows or ('<div class="muted">Ask the guardian anything about the '
+                              'live pipeline — e.g. “what is the biggest risk right now '
+                              'and when will it break?”</div>')
+    panels_html = (
+        '<div class="sec">💬 Ask the Guardian (GitHub Copilot brain)</div>'
+        '<div class="panel">' + chat_rows +
+        '<div class="row">'
+        '<input id="gq" placeholder="what is the biggest risk right now and when will it break?" '
+        "onkeydown=\"if(event.key==='Enter')askGuardian()\">"
+        '<button id="gqbtn" onclick="askGuardian()">Ask</button></div>'
+        '<div class="muted" style="margin-top:6px">Grounded in live telemetry; '
+        'answers can take a few seconds (Copilot brain).</div></div>'
+        '<div class="sec">🧪 Induce your OWN incident (unknown to the AI)</div>'
+        '<div class="panel"><div class="row">' + _INJECT_BUTTONS + '</div>'
+        "<textarea id=\"incops\" placeholder='advanced: ops JSON array, e.g. "
+        "[{&quot;op&quot;:&quot;null_field&quot;,&quot;field&quot;:&quot;size&quot;},"
+        "{&quot;op&quot;:&quot;latency&quot;,&quot;ms&quot;:1200}]'></textarea>"
+        '<div class="row"><input id="inclabel" placeholder="incident name (optional)">'
+        '<button onclick="induceCustom()">Induce custom incident</button></div>'
+        '<div class="muted" style="margin-top:6px">Lands in the next live '
+        '<code>run_demo.py</code> tick. The agent is never told what you did — '
+        'watch it predict the failure.</div></div>'
+    )
+
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="5">
 <title>Predictive Pipeline Guardian</title>
@@ -284,6 +480,14 @@ def render_html() -> str:
  .tag.issue{{background:#8957e5}} .tag.pr{{background:#1f6feb}}
  .muted{{color:#6e7681}} .ok{{color:#3fb950;font-weight:700}} .bad{{color:#f85149;font-weight:700}}
  a{{color:#79c0ff}}
+ .panel{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px;margin-bottom:10px}}
+ .qa{{border-bottom:1px solid #21262d;padding:6px 0;font-size:13px}}
+ .qa .q{{color:#e6edf3}} .qa .a{{color:#9fb6cf;margin-top:3px;white-space:pre-wrap}}
+ .row{{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}}
+ input,textarea{{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:8px;font-family:inherit;font-size:13px}}
+ #gq{{flex:1;min-width:280px}} #incops{{width:100%;min-height:60px;margin-top:6px}}
+ button{{background:#1f6feb;color:#fff;border:none;border-radius:8px;padding:8px 12px;cursor:pointer;font-size:13px}}
+ button.alt{{background:#30363d}} button:disabled{{opacity:.6}}
 </style></head><body><div class="wrap">
  <h1>🔮 Predictive Pipeline Guardian</h1>
  <div class="sub">Predicts data-pipeline failures BEFORE they happen · GitHub Copilot brain · governed by a human · updated {_esc(s["generated_at"][11:19])} UTC</div>
@@ -309,7 +513,8 @@ def render_html() -> str:
  <table><tr><th>Time</th><th>Level</th><th>Risk</th><th>Health</th><th>Lead</th><th>Predicted failure</th><th>Brain</th></tr>{rows}</table>
  <div class="sec">Governance — predicted-incident issues & gated preventive PRs</div>
  {gov}
-</div></body></html>"""
+ {panels_html}
+</div>{_SCRIPT}</body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -334,25 +539,39 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):  # noqa: N802
-        # Grafana alert webhook lands here; record it to the live log stream.
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
         if self.path.startswith("/alert"):
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(length) if length else b""
-            try:
-                payload = json.loads(raw.decode("utf-8")) if raw else {}
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                payload = {}
+            # Grafana alert webhook -> record it to the live log stream.
             try:
                 _record_grafana_alert(payload)
             except Exception:  # noqa: BLE001 - never let a webhook crash the server
                 pass
             body = b'{"status":"received"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            code = 200
+        elif self.path.startswith("/chat"):
+            answer = _answer_question(str(payload.get("q", "")))
+            turns = _chat_load()
+            turns.append({"ts": datetime.now(timezone.utc).isoformat(),
+                          "q": str(payload.get("q", ""))[:500], "a": answer})
+            _chat_save(turns)
+            body = json.dumps({"answer": answer}).encode("utf-8")
+            code = 200
+        elif self.path.startswith("/inject"):
+            body = json.dumps(_write_pending_incident(payload)).encode("utf-8")
+            code = 200
         else:
             body = b'{"error":"not found"}'
-            self.send_response(404)
-            self.send_header("Content-Type", "application/json")
+            code = 404
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

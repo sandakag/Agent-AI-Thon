@@ -17,7 +17,13 @@ Fault injection from the Airflow UI — *Trigger DAG w/ config*:
     {"inject": "null-surge"}      # missing size -> null amounts    (ramps each run)
     {"inject": "volume-drop"}     # upstream stall / starvation     (ramps each run)
     {"inject": "latency-surge"}   # load climbs -> latency SLA breach -> timeout (ramps)
+    {"inject": "custom", "label": "...", "ops": [ ... ]}   # ANYONE's own incident
     {"reset": true}               # clear the ramp + incident banner
+
+A ``custom`` incident is an open-ended list of ramping ``ops`` (null / drop /
+rename / scale / freeze / make-constant / corrupt a field, shrink the batch,
+duplicate rows, add latency) — see :func:`faults.apply_custom`. The agent is
+never told the spec; it must PREDICT the failure from the resulting signals.
 """
 
 from __future__ import annotations
@@ -87,15 +93,24 @@ def do_extract(conf: dict, run_id: str) -> dict:
         clear_incident()
 
     mode = str(conf.get("inject", "none") or "none")
+    spec = None
+    if mode == "custom":
+        inc = conf.get("incident")
+        if isinstance(inc, dict) and inc.get("ops"):
+            spec = inc
+        elif conf.get("ops"):
+            spec = {"ops": conf.get("ops"), "label": conf.get("label")}
     state = _load_state()
     if mode != state.get("mode"):
         state = {"mode": mode, "tick": 0, "baseline_schema": state.get("baseline_schema")}
+    if spec:
+        state["spec"] = spec
     state["tick"] = int(state.get("tick", 0)) + 1
     _save_state(state)
 
     raw = kafka_io.consume_trades()
     # inject_at=1 so the ramp begins immediately on the first injected run
-    raw = apply_fault(raw, mode, state["tick"], inject_at=1)
+    raw = apply_fault(raw, mode, state["tick"], inject_at=1, spec=state.get("spec"))
     audit_trail.stream_emit("guardian_extract", count=len(raw), mode=mode, tick=state["tick"],
                             transport="kafka" if kafka_io.kafka_available() else "coinbase")
     return {"raw": raw, "mode": mode, "tick": state["tick"]}
@@ -109,9 +124,10 @@ def do_transform_load(raw: list[dict], run_id: str) -> dict:
     latency_ms = (time.time() - t0) * 1000.0
 
     state = _load_state()
-    # Load-induced latency + hard processing-timeout break (latency-surge mode).
+    # Load-induced latency + hard processing-timeout break (latency-surge / custom).
     latency_ms, load_error = load_latency(
-        str(state.get("mode", "none")), int(state.get("tick", 0)), latency_ms, inject_at=1
+        str(state.get("mode", "none")), int(state.get("tick", 0)), latency_ms,
+        inject_at=1, spec=state.get("spec")
     )
     if load_error and not etl["failed"]:
         etl["failed"] = True

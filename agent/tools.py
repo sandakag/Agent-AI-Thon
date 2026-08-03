@@ -50,6 +50,27 @@ def ticks_to_threshold(series: list[float], threshold: float):
     return max(0.0, (threshold - cur) / slope)
 
 
+def robust_z_last(series: list[float]) -> float:
+    """Robust z-score (median / MAD) of the latest point vs its recent history.
+
+    Lets the agent flag ANY signal behaving abnormally — even one the fixed
+    detectors were never taught — so a novel, never-before-seen incident still
+    raises risk and wakes the reasoning brain.
+    """
+    if len(series) < 5:
+        return 0.0
+    hist = series[:-1]
+    cur = series[-1]
+    med = statistics.median(hist)
+    mad = statistics.median([abs(x - med) for x in hist])
+    if mad > 1e-9:
+        return 0.6745 * (cur - med) / mad
+    sd = statistics.pstdev(hist)
+    if sd > 1e-9:
+        return (cur - med) / sd
+    return 0.0
+
+
 def ground(collector) -> dict:
     """Compute grounded feature numbers + a transparent heuristic risk.
 
@@ -124,6 +145,28 @@ def ground(collector) -> dict:
         risk += 10.0
         evidence.append(f"duplicate deliveries ({latest['dup_rate']:.0%})")
 
+    # 6) Generic multi-signal anomaly scan — catches NOVEL incidents the fixed
+    #    detectors above were never taught. ANY monitored signal drifting far
+    #    from its OWN recent normal raises risk and wakes the reasoning brain,
+    #    which then diagnoses the unknown incident in its own words.
+    monitored = ("revenue", "throughput_rps", "distinct_products",
+                 "lag_seconds", "dup_rate")
+    anomaly_fields: list[str] = []
+    max_z = 0.0
+    for fld in monitored:
+        z = robust_z_last(collector.series(fld))
+        if abs(z) >= 4.0:
+            anomaly_fields.append(fld)
+            max_z = max(max_z, abs(z))
+            evidence.append(
+                f"anomaly: {fld} far {'above' if z > 0 else 'below'} its normal "
+                f"range (z≈{z:.1f}, now {latest.get(fld)})"
+            )
+    if anomaly_fields:
+        # a clear single-signal deviation reaches AMBER (wakes the reasoning
+        # brain + governance); compounding signals push toward RED.
+        risk += min(60.0, 24.0 * len(anomaly_fields) + min(18.0, 2.0 * max_z))
+
     risk = float(max(0, min(99, round(risk))))
 
     # predicted failure type
@@ -135,6 +178,10 @@ def ground(collector) -> dict:
         failure_type = "upstream stall / throughput collapse"
     elif latest.get("source_errors"):
         failure_type = "source outage"
+    elif anomaly_fields:
+        failure_type = (
+            "emerging anomaly (" + ", ".join(anomaly_fields[:3]) + " deviating)"
+        )
     else:
         failure_type = "none"
 
@@ -165,5 +212,7 @@ def ground(collector) -> dict:
             "latency_slope_ms_per_tick": round(lat_slope, 1),
             "ticks_to_latency_sla": round(lat_ttf, 1) if lat_ttf is not None else None,
             "dup_rate": latest.get("dup_rate"),
+            "anomaly_signals": anomaly_fields,
+            "anomaly_z": round(max_z, 1),
         },
     }
