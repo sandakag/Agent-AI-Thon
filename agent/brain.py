@@ -6,10 +6,9 @@ picks the provider from configuration so the same agent runs on:
 
 * **GitHub Copilot CLI** — the approved brain for local demos / POCs (default).
 * **Tardis / Chatflow** — the sanctioned brain for production (seam below).
-* **GitHub Models** — legacy; retired upstream, kept only for compatibility.
 
 Select with the ``BRAIN`` environment variable
-(``copilot`` | ``tardis`` | ``github_models`` | ``auto``).
+(``copilot`` | ``tardis`` | ``auto``).
 """
 
 from __future__ import annotations
@@ -53,10 +52,6 @@ class TardisBrain:
 def make_brain():
     """Return the configured AI brain (defaults to the GitHub Copilot CLI)."""
     choice = (config.BRAIN or "auto").strip().lower()
-    if choice in ("github_models", "github-models", "models"):
-        from agent.github_models import GitHubModels
-
-        return GitHubModels()
     if choice in ("tardis", "chatflow", "tardis_chatflow"):
         return TardisBrain()
     # "copilot", "copilot_cli", "auto", or anything else -> the demo brain

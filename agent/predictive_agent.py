@@ -1,13 +1,14 @@
-"""The Predictive Agent — the agentic loop bound to GitHub Models.
+"""The Predictive Agent — the agentic loop bound to GitHub Copilot.
 
     perceive (signals) -> recall (vector memory) -> ground (tools)
-      -> reason (GitHub Models LLM) -> decide (structured prediction)
+      -> reason (GitHub Copilot LLM) -> decide (structured prediction)
       -> learn (write the outcome back to memory)
 
-If no GitHub Models token is present, the agent degrades gracefully to the
-transparent tool-based heuristic, so the whole demo still runs end-to-end.
-The LLM never invents the risk from nothing: it is handed the grounded numbers
-and the retrieved precedents, then asked to reason, calibrate and explain.
+If the Copilot brain isn't authenticated (e.g. headless containers), the agent
+degrades gracefully to the transparent tool-based heuristic, so the whole demo
+still runs end-to-end. The LLM never invents the risk from nothing: it is handed
+the grounded numbers and the retrieved precedents, then asked to reason,
+calibrate and explain.
 """
 
 from __future__ import annotations

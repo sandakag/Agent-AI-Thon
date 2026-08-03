@@ -1,7 +1,7 @@
 """One-shot capability self-test for the Predictive Pipeline Guardian.
 
-Verifies, using the token(s) in .env, that everything the project needs works:
-  1. GitHub Models  — the agent's reasoning brain (a real chat call)
+Verifies, using the token in .env, that everything the project needs works:
+  1. AI brain        — GitHub Copilot CLI reachable (the agent's reasoning brain)
   2. GitHub API      — token identity + scopes
   3. Repo access     — can we read the target repo and do we have push rights
   4. Push (write)    — create a throwaway ref and delete it (fully reversible)
@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 
 import config
-from agent.github_models import GitHubModels, GitHubModelsError
+from agent.brain import make_brain, BrainError
 
 GH_API = "https://api.github.com"
 
@@ -70,32 +70,36 @@ def main() -> None:
     print("Predictive Pipeline Guardian - capability self-test")
     print("=" * 76)
 
-    models_token = os.environ.get("GITHUB_MODELS_TOKEN", "")
-    api_token = os.environ.get("GITHUB_TOKEN", "") or models_token
+    api_token = os.environ.get("GITHUB_TOKEN", "")
     slug = repo_slug()
-    reused = "  (reusing MODELS token)" if not os.environ.get("GITHUB_TOKEN") else ""
-    print(f"GITHUB_MODELS_TOKEN : {mask(models_token)}")
-    print(f"git/API token       : {mask(api_token)}{reused}")
+    print(f"git/API token       : {mask(api_token)}")
     print(f"target repo         : {slug or '(unknown)'}")
-    print(f"model               : {config.GITHUB_MODEL}")
+    print(f"AI brain            : {config.BRAIN}")
     print("-" * 76)
 
     results: dict[str, bool] = {}
 
-    # 1) GitHub Models — the agent brain
-    print("[1] GitHub Models (agent brain) ...")
+    # 1) AI brain — GitHub Copilot CLI (the agent's reasoning brain)
+    print("[1] AI brain — GitHub Copilot CLI ...")
     try:
-        gm = GitHubModels()
-        out = gm.chat_json(
-            "You are a test. Reply ONLY strict JSON.",
-            'Return {"ok": true, "pong": "predictive-pipeline"} exactly.',
-        )
-        ok = bool(out) and out.get("ok") is True
-        print(f"    -> {'PASS' if ok else 'PARTIAL'} model replied: {out}")
-        results["models"] = ok
-    except GitHubModelsError as e:
+        brain = make_brain()
+        if brain.available:
+            out = brain.chat_json(
+                "You are a test. Reply ONLY strict JSON.",
+                'Return {"ok": true, "pong": "predictive-pipeline"} exactly.',
+            )
+            ok = bool(out) and out.get("ok") is True
+            print(f"    -> {'PASS' if ok else 'PARTIAL'} {brain.name} replied: {out}")
+            results["brain"] = ok
+        else:
+            print(
+                f"    -> INFO {brain.name} not authenticated here; the agent will "
+                "use the transparent heuristic. Log into Copilot for live AI."
+            )
+            results["brain"] = False
+    except BrainError as e:
         print(f"    -> FAIL {e}")
-        results["models"] = False
+        results["brain"] = False
 
     if not api_token:
         print("[2-4] skipped - no GitHub API token available.")
@@ -165,7 +169,7 @@ def _summary(results: dict) -> None:
     print("-" * 76)
     print("SUMMARY")
     labels = {
-        "models": "GitHub Models (agent brain)",
+        "brain": "AI brain (GitHub Copilot CLI)",
         "identity": "GitHub API identity",
         "repo_read": "Repo read",
         "push_perm": "Push permission (repo says)",

@@ -98,22 +98,12 @@ OTEL_EXPORTER_OTLP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 OTEL_SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "predictive-guardian")
 
 # ---------------------------------------------------------------------------
-# AI brain — GitHub Models (OpenAI-compatible; the approved org tool)
-# ---------------------------------------------------------------------------
-GITHUB_MODELS_ENDPOINT = os.environ.get(
-    "GITHUB_MODELS_ENDPOINT",
-    "https://models.github.ai/inference/chat/completions",
-)
-GITHUB_MODEL = os.environ.get("GITHUB_MODEL", "openai/gpt-4o-mini")
-GITHUB_MODELS_TOKEN = os.environ.get("GITHUB_MODELS_TOKEN", "")
-LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "30"))
-
-# ---------------------------------------------------------------------------
 # AI brain selection — the swappable reasoning layer (see agent/brain.py)
-#   BRAIN = copilot | tardis | github_models | auto
-#     * copilot / auto -> GitHub Copilot CLI, the approved brain for demos / POCs
+#   BRAIN = copilot | tardis | auto
+#     * copilot / auto -> GitHub Copilot CLI, the approved reasoning brain (demo)
 #     * tardis         -> LNRS Tardis / Chatflow, the sanctioned production brain
-#     * github_models  -> legacy (retired upstream); kept for compatibility only
+# The Copilot brain authenticates with its own CLI login (your Copilot seat);
+# there is no model token or endpoint to configure.
 # ---------------------------------------------------------------------------
 BRAIN = os.environ.get("BRAIN", "auto")
 

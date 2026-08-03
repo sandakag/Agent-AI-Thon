@@ -6,9 +6,9 @@ its reply defensively (post). It runs under the user's approved GitHub Copilot
 seat via the CLI that ships with the VS Code Copilot extension — no extra service
 to provision and no dependency on the retired GitHub Models endpoint.
 
-Interface-compatible with the old ``GitHubModels`` client (``available`` /
-``chat`` / ``chat_json`` / ``model`` / ``name``) so it is a drop-in for the
-predictive agent.
+Exposes the standard brain interface (``available`` / ``chat`` / ``chat_json``
+/ ``model`` / ``name``) so it is a drop-in reasoning brain for the predictive
+agent.
 
 Notes
 -----

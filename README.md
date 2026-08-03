@@ -251,7 +251,6 @@ number directly on the host path.
 |---|---|---|
 | `copilot` | host / demo | **GitHub Copilot CLI** (needs a VS Code Copilot login) |
 | `tardis` | production | in-cluster model seam (runs headless in containers) |
-| `github_models` | legacy | retired GitHub Models endpoint |
 | `auto` *(default)* | anywhere | try Copilot, else a transparent **heuristic** — safe in containers |
 
 > **Why the split?** The Copilot CLI can't authenticate headlessly, so *inside*
