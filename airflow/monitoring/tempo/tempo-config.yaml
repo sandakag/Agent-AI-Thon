@@ -1,0 +1,44 @@
+# Grafana Tempo — single-binary trace backend for the Predictive Guardian.
+#
+# The OTel Collector receives OTLP traces from auto-instrumented Python services
+# and forwards them here via internal gRPC (tempo:4317). Grafana queries Tempo
+# on :3200 and correlates traces with Loki logs and Prometheus metrics.
+#
+# Storage: filesystem (local demo). WAL + blocks retained for 1 h so the demo
+# never fills disk while still having enough history to explore.
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 1h
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+query_frontend:
+  search:
+    duration_slo: 5s
+    throughput_bytes_slo: 1.073741824e+09
+  trace_by_id:
+    duration_slo: 5s

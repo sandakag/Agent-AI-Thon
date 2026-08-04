@@ -1,5 +1,7 @@
-# Auto-provision the Prometheus + Loki datasources so Grafana works on first
-# boot with zero manual clicking.
+# Auto-provision Prometheus + Loki + Tempo datasources so Grafana works on
+# first boot with zero manual clicking.  Cross-signal correlations are wired
+# so a trace in Tempo links back to the matching Loki logs, and service-map
+# overlays are driven by Prometheus metrics.
 apiVersion: 1
 
 datasources:
@@ -10,9 +12,53 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: true
+    jsonData:
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: tempo
+
   - name: Loki
     uid: loki
     type: loki
     access: proxy
     url: http://loki:3100
     editable: true
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          matcherRegex: '"trace_id":"(\w+)"'
+          url: "$${__value.raw}"
+          datasourceUid: tempo
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: true
+    jsonData:
+      # Trace -> logs: jump from a span directly to the matching Loki stream
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift: "1h"
+        filterByTraceID: true
+        filterBySpanID: false
+        customQuery: false
+      # Trace -> metrics: correlate span latency with Prometheus KPIs
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        queries:
+          - name: Request rate
+            query: "rate(http_server_duration_milliseconds_count{$$__tags}[5m])"
+      # Service map via Prometheus (populated by the OTel Collector)
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
+      lokiSearch:
+        datasourceUid: loki
