@@ -134,4 +134,14 @@ def _default_action(failure_type: str) -> str:
         return "Check upstream producer / consumer lag; scale consumers; backfill the window."
     if "outage" in ft or "source" in ft:
         return "Fail over to a backup source / cache; reconnect with backoff."
+    if "null" in ft or "quality" in ft:
+        return (
+            "Quarantine + repair the malformed records and resolve field aliases before "
+            "load; the batch is trending toward the null-rate line that zeroes revenue."
+        )
+    if "anomaly" in ft:
+        return (
+            "Investigate the flagged signal against recent upstream / deploy changes; "
+            "confirm the deviation is real, then contain the source before it breaches."
+        )
     return "Continue monitoring; no action needed."

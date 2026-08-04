@@ -1,6 +1,15 @@
 """Deterministic grounding tools the agent calls so its risk / confidence are
 backed by real numbers (better calibration, less hallucination). Pure stdlib —
 this is the "scikit-learn style" tool layer, kept dependency-free for the demo.
+
+Detection is signal-agnostic: instead of a hand-written rule per fault, EVERY
+numeric signal is fed through the same online forecasting model (see
+``agent/forecaster.py``). The model learns each signal's own normal, scores how
+surprised it is by the latest value (onset), and projects the trajectory to a
+breach (imminence). Risk therefore reacts to the statistics of ANY signal —
+including incidents the system was never taught — and it fires BEFORE the
+failure line is crossed. The per-signal names/labels below are EXPLANATIONS of
+whichever signal moved, not the thing that triggers detection.
 """
 
 from __future__ import annotations
@@ -8,6 +17,38 @@ from __future__ import annotations
 import statistics
 
 import config
+from agent import forecaster
+
+# Human labels for each monitored signal — used only to EXPLAIN which signal
+# drove the risk, never to trigger it.
+_MONITOR_LABEL = {
+    "null_rate": "data-quality (null-rate)",
+    "latency_ms": "processing latency",
+    "record_count": "throughput / volume",
+    "revenue": "revenue",
+    "throughput_rps": "throughput rate",
+    "distinct_products": "product coverage",
+    "lag_seconds": "event lag / freshness",
+    "dup_rate": "duplicate rate",
+    "source_errors": "source errors",
+}
+
+# The continuous signals modelled by the forecaster (all treated identically).
+_NUMERIC_SIGNALS = (
+    "null_rate", "latency_ms", "record_count", "revenue",
+    "throughput_rps", "distinct_products", "lag_seconds", "dup_rate",
+)
+
+# Real failure lines. Used ONLY to convert a drift into a time-to-breach — they
+# are operating limits for the "ticks-to-breach" story, not the detector.
+_HARD_LIMITS = {
+    "null_rate": (None, config.NULL_RATE_CRITICAL),
+    "latency_ms": (None, config.LATENCY_TIMEOUT_MS),
+    "record_count": (config.MIN_RECORDS, None),
+}
+
+_Z_ONSET = 3.5     # forecast surprise the model considers clearly abnormal
+_HORIZON = 12.0    # ticks ahead we still count as "imminent"
 
 
 def trend_slope(series: list[float]) -> float:
@@ -72,147 +113,169 @@ def robust_z_last(series: list[float]) -> float:
 
 
 def ground(collector) -> dict:
-    """Compute grounded feature numbers + a transparent heuristic risk.
+    """Signal-agnostic, forecasting-based grounding.
 
-    Returned dict is used both as the fallback prediction AND as the evidence
-    handed to the GitHub Models brain so it never invents risk from nothing.
+    Every numeric signal is run through the SAME online model (see
+    ``agent/forecaster.py``): learn its own normal, score the forecast
+    ``surprise`` of the latest value (onset of a deviation), and project the
+    trajectory to a breach of an operating limit (imminence). The risk is fused
+    from whichever signals moved — so a NOVEL incident on ANY signal is caught,
+    and it is caught *before* the failure line is crossed. The per-signal labels
+    below only EXPLAIN which signal drove the risk; they don't trigger it.
+
+    The returned dict is used both as the transparent fallback prediction AND as
+    the grounded evidence handed to the reasoning brain, so the LLM never invents
+    risk from nothing.
     """
-    null_series = collector.series("null_rate")
-    vol_series = collector.series("record_count")
-    lat_series = collector.series("latency_ms")
     latest = collector.history[-1] if collector.history else {}
+    hist_len = len(collector.history)
 
-    null_slope = trend_slope(null_series)
-    null_r2 = r_squared(null_series)
-    ttf_ticks = ticks_to_threshold(null_series, config.NULL_RATE_CRITICAL)
-
-    lat_slope = trend_slope(lat_series)
-    lat_r2 = r_squared(lat_series)
-    lat_ttf = ticks_to_threshold(lat_series, config.SLA_LATENCY_MS)
-    cur_lat = latest.get("latency_ms", 0.0) or 0.0
-
-    evidence: list[str] = []
-    risk = 0.0
-
-    # 1) Data-quality trend toward the load-failure line
-    cur_null = latest.get("null_rate", 0.0) or 0.0
-    if cur_null > 0:
-        risk += min(40.0, cur_null / config.NULL_RATE_CRITICAL * 40.0)
-    if null_slope > 0.002 and ttf_ticks is not None:
-        risk += 30.0
-        evidence.append(
-            f"null-rate rising (slope={null_slope:.3f}/tick, now {cur_null:.0%}, "
-            f"~{ttf_ticks:.1f} ticks to the {config.NULL_RATE_CRITICAL:.0%} load-fail line)"
-        )
-
-    # 2) Schema drift
-    if latest.get("schema_drift"):
-        risk += 35.0
-        evidence.append("schema drift vs baseline (upstream field renamed/added)")
-
-    # 3) Volume collapse / starvation
-    if vol_series:
-        base = statistics.median(vol_series)
-        cur_vol = vol_series[-1]
-        if base and cur_vol < base * 0.5:
-            risk += 25.0
-            evidence.append(f"throughput collapse ({cur_vol} vs median {base:.0f} records)")
-        if cur_vol < config.MIN_RECORDS:
-            risk += 15.0
-            evidence.append(f"record count {cur_vol} below floor {config.MIN_RECORDS}")
-
-    # 4) Latency / load trend toward the processing-timeout SLA (early warning)
-    if cur_lat > 0:
-        risk += min(35.0, cur_lat / config.SLA_LATENCY_MS * 35.0)
-    if lat_slope > 1.0 and lat_ttf is not None:
-        risk += 25.0
-        evidence.append(
-            f"latency rising under load (slope={lat_slope:.0f}ms/tick, now "
-            f"{cur_lat:.0f}ms, ~{lat_ttf:.1f} ticks to the "
-            f"{config.SLA_LATENCY_MS:.0f}ms SLA)"
-        )
-    if cur_lat > config.SLA_LATENCY_MS:
-        risk += 15.0
-        evidence.append(
-            f"latency over SLA ({cur_lat:.0f}ms > {config.SLA_LATENCY_MS:.0f}ms)"
-        )
-
-    # 5) Source health / duplicates
-    if latest.get("source_errors"):
-        risk += 20.0
-        evidence.append("source fetch errors (upstream API degraded)")
-    if latest.get("dup_rate", 0) > 0.1:
-        risk += 10.0
-        evidence.append(f"duplicate deliveries ({latest['dup_rate']:.0%})")
-
-    # 6) Generic multi-signal anomaly scan — catches NOVEL incidents the fixed
-    #    detectors above were never taught. ANY monitored signal drifting far
-    #    from its OWN recent normal raises risk and wakes the reasoning brain,
-    #    which then diagnoses the unknown incident in its own words.
-    monitored = ("revenue", "throughput_rps", "distinct_products",
-                 "lag_seconds", "dup_rate")
+    drivers: list[tuple] = []       # (score, field, direction, z, ttb)
     anomaly_fields: list[str] = []
-    max_z = 0.0
-    for fld in monitored:
-        z = robust_z_last(collector.series(fld))
-        if abs(z) >= 4.0:
-            anomaly_fields.append(fld)
-            max_z = max(max_z, abs(z))
-            evidence.append(
-                f"anomaly: {fld} far {'above' if z > 0 else 'below'} its normal "
-                f"range (z≈{z:.1f}, now {latest.get(fld)})"
-            )
-    if anomaly_fields:
-        # a clear single-signal deviation reaches AMBER (wakes the reasoning
-        # brain + governance); compounding signals push toward RED.
-        risk += min(60.0, 24.0 * len(anomaly_fields) + min(18.0, 2.0 * max_z))
+    lead_candidates: list[float] = []
+    top_z = 0.0
+
+    # --- The general detector: identical maths for every continuous signal ---
+    for fld in _NUMERIC_SIGNALS:
+        s = collector.series(fld)
+        if len(s) < 6:
+            continue  # not enough history yet to know this signal's normal
+        z, level, trend = forecaster.surprise_z(s)
+        az = abs(z)
+        cur = s[-1]
+        base = statistics.median(s[:-1])
+        scale = forecaster.robust_scale(s[:-1])
+        direction = "rising" if cur >= base else "falling"
+
+        # (a) ONSET — the model is surprised by the latest value (works on any
+        #     signal, including a fault never seen before).
+        onset = 0.0
+        if az >= _Z_ONSET:
+            onset = min(1.0, 0.35 + (az - _Z_ONSET) / 6.0)
+
+        # (b) IMMINENCE — the smoothed trajectory is heading toward a real
+        #     failure line within the horizon...
+        imm = 0.0
+        ttb = None
+        lo, hi = _HARD_LIMITS.get(fld, (None, None))
+        if lo is not None or hi is not None:
+            ttb = forecaster.ticks_to_band(level, trend, lo, hi)
+            if ttb is not None and ttb <= _HORIZON:
+                imm = min(1.0, (_HORIZON - ttb) / _HORIZON)
+                lead_candidates.append(ttb)
+        elif scale > 0:
+            # ...or, for a signal with no fixed limit, it has clearly left its
+            #    own normal band and is still moving further out (a sustained,
+            #    directional anomaly rather than a one-off blip).
+            dev = (cur - base) / scale
+            if abs(dev) >= 4.0 and ((dev > 0 and trend > 0) or (dev < 0 and trend < 0)):
+                imm = min(1.0, 0.3 + (abs(dev) - 4.0) / 6.0)
+
+        if onset <= 0 and imm <= 0:
+            continue
+        score = min(100.0, 100.0 * (0.6 * onset + 0.6 * imm))
+        drivers.append((score, fld, direction, az, ttb))
+        anomaly_fields.append(fld)
+        top_z = max(top_z, az)
+
+    # Discrete failure FLAGS the smooth forecaster genuinely can't model (they
+    # sit at a constant baseline until they fire) are surfaced directly. This is
+    # not per-fault tuning — it just acknowledges non-continuous signals.
+    source_errors = latest.get("source_errors") or 0
+    if source_errors:
+        drivers.append((min(100.0, 55.0 + 6.0 * source_errors),
+                        "source_errors", "rising", 0.0, None))
+        anomaly_fields.append("source_errors")
+
+    drivers.sort(reverse=True)
+
+    # --- Fuse: the worst signal sets the level; corroborating signals add on ---
+    risk = 0.0
+    if drivers:
+        worst = drivers[0][0]
+        extra = sum(1 for d in drivers[1:] if d[0] >= 30.0)
+        risk = worst + min(18.0, 7.0 * extra)
+
+    # Schema drift is a discrete hash change; its numeric effect (null-rate) is
+    # already caught above, but surface the categorical event too.
+    schema_drift = bool(latest.get("schema_drift"))
+    if schema_drift:
+        risk = max(risk, 45.0)
 
     risk = float(max(0, min(99, round(risk))))
 
-    # predicted failure type
-    if latest.get("schema_drift") or (null_slope > 0.002 and cur_null > 0):
-        failure_type = "schema-drift / parse failure -> $0 revenue"
-    elif (lat_slope > 1.0 and lat_ttf is not None) or cur_lat > config.SLA_LATENCY_MS:
-        failure_type = "latency degradation / processing timeout under load"
-    elif vol_series and vol_series[-1] < config.MIN_RECORDS:
-        failure_type = "upstream stall / throughput collapse"
-    elif latest.get("source_errors"):
-        failure_type = "source outage"
-    elif anomaly_fields:
-        failure_type = (
-            "emerging anomaly (" + ", ".join(anomaly_fields[:3]) + " deviating)"
+    # --- Explanation: describe whichever signals actually drove the risk ---
+    evidence: list[str] = []
+    if schema_drift:
+        evidence.append(
+            "schema hash changed vs baseline (upstream field renamed / added / dropped)"
         )
-    else:
-        failure_type = "none"
+    for score, fld, direction, az, ttb in drivers[:4]:
+        if fld == "source_errors":
+            evidence.append(f"source fetch errors firing (now {source_errors})")
+            continue
+        msg = (f"{_MONITOR_LABEL[fld]} {direction} abnormally "
+               f"(forecast surprise z\u2248{az:.1f}, now {latest.get(fld)}")
+        if ttb is not None:
+            msg += f"; ~{ttb:.1f} ticks to its limit"
+        msg += ")"
+        evidence.append(msg)
+    if not evidence:
+        evidence = ["all signals within their learned normal range"]
 
-    # lead time = the SOONEST projected breach across the data-quality and the
-    # latency/load trends (whichever failure is predicted to arrive first)
-    candidates = [t for t in (ttf_ticks, lat_ttf) if t not in (None, 0)]
-    lead_ticks = min(candidates) if candidates else None
+    failure_type = _classify(drivers, schema_drift)
+    lead_ticks = min(lead_candidates) if lead_candidates else None
 
-    # confidence from the strongest trend fit + amount of accumulated history
-    hist = len(collector.history)
-    fit = max(null_r2, lat_r2)
-    confidence = round(min(0.95, 0.4 + 0.4 * fit + min(0.15, hist / 100.0)), 2)
+    # Confidence: how well-defined the driving signal's recent trajectory is,
+    # plus how much history we've accumulated.
+    fit = r_squared(collector.series(drivers[0][1])[-12:]) if drivers else 0.0
+    confidence = round(min(0.95, 0.45 + 0.35 * fit + min(0.15, hist_len / 100.0)), 2)
+
+    # Legacy display features (kept for the dashboard; no longer drive risk).
+    null_series = collector.series("null_rate")
+    lat_series = collector.series("latency_ms")
+    null_slope = trend_slope(null_series)
+    lat_slope = trend_slope(lat_series)
+    lat_ttf = ticks_to_threshold(lat_series, config.SLA_LATENCY_MS)
 
     return {
         "risk_score": risk,
         "predicted_failure_type": failure_type,
         "lead_ticks": lead_ticks,
         "confidence": confidence,
-        "evidence": evidence or ["all signals within normal range"],
+        "evidence": evidence,
         "features": {
-            "null_rate": round(cur_null, 4),
+            "null_rate": latest.get("null_rate"),
             "null_slope_per_tick": round(null_slope, 4),
-            "null_trend_r2": round(null_r2, 2),
+            "null_trend_r2": round(r_squared(null_series), 2),
             "record_count": latest.get("record_count"),
-            "schema_drift": latest.get("schema_drift", False),
+            "schema_drift": schema_drift,
             "lag_seconds": latest.get("lag_seconds"),
             "latency_ms": latest.get("latency_ms"),
             "latency_slope_ms_per_tick": round(lat_slope, 1),
             "ticks_to_latency_sla": round(lat_ttf, 1) if lat_ttf is not None else None,
             "dup_rate": latest.get("dup_rate"),
+            "anomaly_driver": drivers[0][1] if drivers else None,
             "anomaly_signals": anomaly_fields,
-            "anomaly_z": round(max_z, 1),
+            "anomaly_z": round(top_z, 1),
         },
     }
+
+
+def _classify(drivers: list[tuple], schema_drift: bool) -> str:
+    """Name the failure from whichever signal dominated the fused risk. This is
+    an EXPLANATION of the general detector's output, not what triggered it."""
+    if schema_drift:
+        return "schema-drift / parse failure -> $0 revenue"
+    if not drivers:
+        return "none"
+    top = drivers[0][1]
+    if top == "null_rate":
+        return "data-quality / null-rate surge -> $0 revenue"
+    if top == "latency_ms":
+        return "latency degradation / processing timeout under load"
+    if top in ("record_count", "throughput_rps"):
+        return "upstream stall / throughput collapse"
+    if top == "source_errors":
+        return "source outage / upstream API degraded"
+    return f"emerging anomaly ({_MONITOR_LABEL[top]} {drivers[0][2]})"
