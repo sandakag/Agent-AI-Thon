@@ -47,8 +47,16 @@ _HARD_LIMITS = {
     "record_count": (config.MIN_RECORDS, None),
 }
 
-_Z_ONSET = 3.5     # forecast surprise the model considers clearly abnormal
 _HORIZON = 12.0    # ticks ahead we still count as "imminent"
+_CONFIRM_SIGMA = 4.0   # a signal is "anomalous" only past this many robust-sigma
+
+# Which way is "bad" for each signal — the SAME orientation every monitoring
+# tool encodes: latency / null-rate / lag / duplicates are dangerous when they
+# rise; revenue / throughput / record volume / product coverage are dangerous
+# when they FALL. A move in the safe direction (revenue rising, latency easing)
+# is never a pipeline failure, so it must not raise risk. This is per-signal
+# ORIENTATION, not per-fault tuning — it says nothing about any specific fault.
+_DANGER_UP = frozenset({"null_rate", "latency_ms", "lag_seconds", "dup_rate"})
 
 
 def trend_slope(series: list[float]) -> float:
@@ -112,6 +120,17 @@ def robust_z_last(series: list[float]) -> float:
     return 0.0
 
 
+def _deviation(value: float, ref_median: float, ref_scale: float) -> float:
+    """Robust deviation of ``value`` from a signal's stable reference. When the
+    reference is effectively constant, any change is treated as a hard deviation
+    so stepped / constant-valued signals are still caught."""
+    if ref_scale > 1e-9:
+        return (value - ref_median) / ref_scale
+    if abs(value - ref_median) <= 1e-9:
+        return 0.0
+    return 10.0 if value > ref_median else -10.0
+
+
 def ground(collector) -> dict:
     """Signal-agnostic, forecasting-based grounding.
 
@@ -136,43 +155,59 @@ def ground(collector) -> dict:
     top_z = 0.0
 
     # --- The general detector: identical maths for every continuous signal ---
+    # Each signal is scored two ways, learned purely from its OWN past:
+    #   onset     — how far outside its established normal the latest value sits
+    #   imminence — how soon its smoothed trajectory will breach a real limit
+    # An anomaly must PERSIST for >=3 ticks (same direction) before it counts, so
+    # a transient market blip (e.g. a one-off whale trade that inflates revenue
+    # for a tick or two) on noisy live data never raises a false alarm, while a
+    # real fault (which ramps over many ticks) is still caught early.
     for fld in _NUMERIC_SIGNALS:
         s = collector.series(fld)
         if len(s) < 6:
             continue  # not enough history yet to know this signal's normal
-        z, level, trend = forecaster.surprise_z(s)
-        az = abs(z)
-        cur = s[-1]
-        base = statistics.median(s[:-1])
-        scale = forecaster.robust_scale(s[:-1])
-        direction = "rising" if cur >= base else "falling"
 
-        # (a) ONSET — the model is surprised by the latest value (works on any
-        #     signal, including a fault never seen before).
-        onset = 0.0
-        if az >= _Z_ONSET:
-            onset = min(1.0, 0.35 + (az - _Z_ONSET) / 6.0)
+        # Stable reference = history EXCLUDING the last 3 (possibly-anomalous)
+        # points, so a fresh spike/step can't poison its own baseline.
+        ref = s[:-3] if len(s) >= 9 else s[:-1]
+        rmed = statistics.median(ref)
+        rscale = forecaster.robust_scale(ref)
+        dev_last = _deviation(s[-1], rmed, rscale)
+        dev_prev = _deviation(s[-2], rmed, rscale)
+        dev_prev2 = _deviation(s[-3], rmed, rscale)
+        az = abs(dev_last)
+        direction = "rising" if s[-1] >= rmed else "falling"
 
-        # (b) IMMINENCE — the smoothed trajectory is heading toward a real
-        #     failure line within the horizon...
+        # DIRECTION: only a move TOWARD degradation is a risk. A revenue / volume
+        # / throughput RISE or a null / latency DROP is a healthy move, never a
+        # failure — ignoring it is what keeps live market swings GREEN.
+        dangerous = (dev_last > 0) if fld in _DANGER_UP else (dev_last < 0)
+        if not dangerous:
+            continue
+
+        # CONFIRMATION: only a deviation SUSTAINED for 3 consecutive ticks in the
+        # SAME direction counts. A transient 1-2 tick blip (market noise / a lone
+        # whale trade) is ignored; a real fault ramps over many ticks and passes.
+        if not (az >= _CONFIRM_SIGMA
+                and abs(dev_prev) >= 3.0 and abs(dev_prev2) >= 3.0
+                and (dev_last > 0) == (dev_prev > 0) == (dev_prev2 > 0)):
+            continue
+
+        # (a) ONSET — how far outside its own learned normal the signal now sits.
+        onset = min(1.0, 0.4 + (az - _CONFIRM_SIGMA) / 6.0)
+
+        # (b) IMMINENCE — project the smoothed trajectory to a real failure line;
+        #     yields the ticks-to-breach lead time that makes this predictive.
         imm = 0.0
         ttb = None
+        level, trend, _ = forecaster.holt(s)
         lo, hi = _HARD_LIMITS.get(fld, (None, None))
         if lo is not None or hi is not None:
             ttb = forecaster.ticks_to_band(level, trend, lo, hi)
             if ttb is not None and ttb <= _HORIZON:
                 imm = min(1.0, (_HORIZON - ttb) / _HORIZON)
                 lead_candidates.append(ttb)
-        elif scale > 0:
-            # ...or, for a signal with no fixed limit, it has clearly left its
-            #    own normal band and is still moving further out (a sustained,
-            #    directional anomaly rather than a one-off blip).
-            dev = (cur - base) / scale
-            if abs(dev) >= 4.0 and ((dev > 0 and trend > 0) or (dev < 0 and trend < 0)):
-                imm = min(1.0, 0.3 + (abs(dev) - 4.0) / 6.0)
 
-        if onset <= 0 and imm <= 0:
-            continue
         score = min(100.0, 100.0 * (0.6 * onset + 0.6 * imm))
         drivers.append((score, fld, direction, az, ttb))
         anomaly_fields.append(fld)

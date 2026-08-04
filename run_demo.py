@@ -86,7 +86,9 @@ def main() -> None:
                  "latency-surge", "custom"],
         default="none",
     )
-    ap.add_argument("--inject-at", type=int, default=3, help="tick to start the fault")
+    ap.add_argument("--inject-at", type=int, default=8,
+                    help="tick to start the fault (after a healthy warmup so the "
+                         "detector has learned each signal's normal first)")
     ap.add_argument("--incident", default=None,
                     help="custom incident spec as a JSON string (with --inject custom)")
     ap.add_argument("--incident-file", default=None,
@@ -124,7 +126,6 @@ def main() -> None:
     active_inject_at = args.inject_at
 
     for tick in range(1, args.ticks + 1):
-        t0 = time.time()
         pend = _consume_pending()
         if pend:
             active_mode, active_spec, active_inject_at = "custom", pend, tick
@@ -132,6 +133,10 @@ def main() -> None:
                   f"(audience-authored) — ramp starts now at tick {tick}")
         raw = fetch_batch()
         raw = apply_fault(raw, active_mode, tick, inject_at=active_inject_at, spec=active_spec)
+        # Latency = ETL PROCESSING time only (the pipeline's own SLA). The external
+        # data-source fetch is excluded so its network jitter can't masquerade as a
+        # processing-latency fault. Modeled load faults add on top in load_latency().
+        t0 = time.time()
         etl = run_etl(raw)
         latency_ms = (time.time() - t0) * 1000.0
         latency_ms, load_error = load_latency(
