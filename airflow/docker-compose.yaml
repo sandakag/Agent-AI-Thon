@@ -6,7 +6,13 @@
 # containers, networks or volumes. Do NOT remove the `name:` key below.
 #
 #   Airflow (LocalExecutor + Postgres) | Kafka 3.7 (KRaft) | Spark 3.5.1 | Kafka-UI
-#   Prometheus + Grafana + Loki + Promtail | live dashboard | Coinbase stream tap
+#   Prometheus + Grafana + Loki + Promtail + Tempo | live dashboard | Coinbase stream tap
+#
+# OpenTelemetry zero-code instrumentation:
+#   Python services (dashboard, stream-generator) are wrapped with
+#   `opentelemetry-instrument` so traces/metrics/logs flow automatically to the
+#   OTel Collector without any source-code changes.  The collector fans them out
+#   to Tempo (traces), Prometheus (metrics), and Loki (logs).
 #
 # Launch:  docker compose --env-file ../.env --profile full up -d --build
 # UIs:     Airflow    http://localhost:18080  (admin/admin)
@@ -15,6 +21,7 @@
 #          Spark      http://localhost:18081
 #          Grafana    http://localhost:13001  (no login — anonymous Admin)
 #          Prometheus http://localhost:19090
+#          Tempo      http://localhost:13200
 ---
 name: agent-aithon
 x-airflow-common: &airflow-common
@@ -53,10 +60,19 @@ x-airflow-common: &airflow-common
     # --- Grafana IRM / Incident (optional real incident on the predicted failure) ---
     GRAFANA_IRM_URL: ${GRAFANA_IRM_URL:-}
     GRAFANA_IRM_TOKEN: ${GRAFANA_IRM_TOKEN:-}
-    # --- OpenTelemetry (OTLP -> collector; optional per-cycle app telemetry) ---
+    # --- OpenTelemetry zero-code auto-instrumentation ---
+    # Services wrapped with `opentelemetry-instrument` pick these up automatically.
     OTEL_ENABLED: ${OTEL_ENABLED:-true}
-    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
     OTEL_SERVICE_NAME: predictive-guardian
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+    OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    OTEL_TRACES_EXPORTER: otlp
+    OTEL_METRICS_EXPORTER: otlp
+    OTEL_LOGS_EXPORTER: otlp
+    OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+    # Propagate trace context across HTTP calls (W3C TraceContext + Baggage)
+    OTEL_PROPAGATORS: tracecontext,baggage
+    OTEL_RESOURCE_ATTRIBUTES: deployment.environment=docker,service.namespace=predictive-guardian
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
@@ -156,7 +172,10 @@ services:
   stream-generator:
     <<: *airflow-common
     profiles: ["full"]
-    command: ["python", "/opt/airflow/project/airflow/stream_generator.py"]
+    # Zero-code OTel instrumentation: wrapping with opentelemetry-instrument
+    # auto-instruments urllib, kafka-python, logging — no source changes needed.
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["opentelemetry-instrument python /opt/airflow/project/airflow/stream_generator.py"]
     environment:
       <<: *airflow-common-env
       STREAM_INTERVAL_SECONDS: "5"
@@ -215,10 +234,14 @@ services:
 
   dashboard:
     <<: *airflow-common
-    command: ["python", "-m", "dashboard"]
+    # Zero-code OTel instrumentation: auto-instruments the stdlib HTTP server,
+    # urllib calls (Coinbase fetches), and logging — no source changes needed.
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["opentelemetry-instrument python -m dashboard"]
     environment:
       <<: *airflow-common-env
       DASHBOARD_PORT: "8089"
+      OTEL_SERVICE_NAME: predictive-guardian-dashboard
     ports:
       - "18089:8089"
     depends_on:
@@ -229,17 +252,35 @@ services:
   # --- OpenTelemetry Collector: scrapes the guardian /metrics, accepts OTLP
   #     from the Python components, and exposes its own health/throughput so the
   #     OpenTelemetry service itself can be monitored in Grafana. ---
+  # --- Grafana Tempo — distributed trace backend. ---
+  # The OTel Collector forwards spans here via internal gRPC (tempo:4317).
+  # Grafana queries Tempo on :3200; expose only the HTTP API to the host.
+  tempo:
+    image: grafana/tempo:2.6.0
+    command: ["-config.file=/etc/tempo/tempo-config.yaml"]
+    volumes:
+      - ./monitoring/tempo/tempo-config.yaml:/etc/tempo/tempo-config.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "13200:3200"   # Tempo HTTP API / Grafana datasource
+    restart: always
+
+  # --- OpenTelemetry Collector: receives OTLP from auto-instrumented services,
+  #     fans out to Tempo (traces), Prometheus (metrics), Loki (logs). ---
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.109.0
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
       - ./monitoring/otel/guardian-collector.yaml:/etc/otelcol/config.yaml:ro
     ports:
-      - "14317:4317"   # OTLP gRPC
-      - "14318:4318"   # OTLP HTTP
+      - "14317:4317"   # OTLP gRPC  (apps -> collector)
+      - "14318:4318"   # OTLP HTTP  (apps -> collector)
       - "18888:8888"   # collector internal telemetry (Prometheus scrapes this)
     depends_on:
       - dashboard
+      - tempo
+      - loki
+      - prometheus
     restart: always
 
   prometheus:
@@ -250,6 +291,9 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=15d"
+      # Required for the OTel Collector prometheusremotewrite exporter to push
+      # OTLP metrics into Prometheus.
+      - "--web.enable-remote-write-receiver"
     ports:
       - "19090:9090"
     depends_on:
@@ -266,6 +310,8 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
       GF_AUTH_ANONYMOUS_ORG_NAME: "Main Org."
+      # Enable Tempo/tracing feature flags
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor,traceToMetrics
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -274,6 +320,8 @@ services:
       - "13001:3000"
     depends_on:
       - prometheus
+      - loki
+      - tempo
     restart: always
 
   loki:
@@ -301,3 +349,4 @@ volumes:
   prometheus-data:
   grafana-data:
   loki-data:
+  tempo-data:

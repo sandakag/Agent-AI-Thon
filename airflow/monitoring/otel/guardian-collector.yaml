@@ -1,18 +1,21 @@
-# OpenTelemetry Collector — the telemetry service for the Predictive Guardian.
+# OpenTelemetry Collector — the telemetry hub for the Predictive Guardian.
 #
-# It does real work (so it can be meaningfully monitored):
-#   1) prometheus receiver  -> actively SCRAPES the guardian /metrics endpoint
-#   2) otlp receiver         -> accepts traces + metrics from the Python
-#                               components (gRPC 4317 / HTTP 4318) when the OTLP
-#                               SDK is present in the image
-#   3) debug exporter        -> sink for the ingested guardian metrics
+# Zero-code auto-instrumented Python services export OTLP telemetry here; the
+# collector fans it out to the purpose-built backends:
 #
-# The collector's OWN health/throughput is published on :8888 (internal
-# telemetry, served via plain promhttp) and scraped by Prometheus — that feeds
-# the "OpenTelemetry service performance" Grafana dashboard (otelcol_receiver_*,
-# otelcol_exporter_*, otelcol_process_*). So even with zero app instrumentation
-# the OTel board is alive, because the collector is continuously scraping the
-# guardian endpoint and reporting its own throughput.
+#   Traces  -> Grafana Tempo   (gRPC otlp/tempo, tempo:4317)
+#   Metrics -> Prometheus      (remote-write, prometheus:9090/api/v1/write)
+#   Logs    -> Grafana Loki    (HTTP loki exporter, loki:3100)
+#
+# Receivers
+#   otlp       : accepts traces + metrics + logs from Python services
+#                (gRPC 4317 / HTTP 4318)
+#   prometheus : actively scrapes the guardian /metrics endpoint so Prometheus
+#                KPIs are also available in the OTel pipeline
+#
+# The collector's OWN health/throughput is published on :8888 (promhttp) and
+# scraped by Prometheus, feeding the "OpenTelemetry service performance"
+# Grafana dashboard (otelcol_receiver_*, otelcol_exporter_*, otelcol_process_*).
 
 receivers:
   otlp:
@@ -34,37 +37,61 @@ receivers:
 processors:
   batch:
     timeout: 5s
+  # Ensure every span / metric / log record carries the canonical service name.
+  resource:
+    attributes:
+      - action: upsert
+        key: service.name
+        from_attribute: service.name
+      - action: insert
+        key: service.namespace
+        value: predictive-guardian
 
 exporters:
-  # NOTE: intentionally NO Prometheus *exporter* (:8889 pull server). In
-  # otel-collector-contrib 0.109 that server's HTTP handler is wrapped in
-  # otelhttp instrumentation that double-writes the response header and spams
-  # "superfluous response.WriteHeader call" on every scrape. The collector still
-  # does real work (the prometheus *receiver* scrapes the guardian /metrics
-  # endpoint), and its own health/throughput is published spam-free on :8888.
   debug:
     verbosity: basic
+
+  # Traces -> Grafana Tempo (internal gRPC, no TLS needed inside Docker network)
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Metrics -> Prometheus via remote-write (requires --web.enable-remote-write-receiver
+  # on the Prometheus process, set in the prometheus service command below).
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    tls:
+      insecure: true
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Logs -> Grafana Loki
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    tls:
+      insecure: true
+    default_labels_enabled:
+      exporter: false
+      job: true
+      instance: true
+      level: true
 
 service:
   telemetry:
     metrics:
-      # `normal` exports every metric the OTel dashboard queries
-      # (otelcol_receiver_*, otelcol_exporter_*, otelcol_process_*), published on
-      # the built-in :8888 endpoint that Prometheus scrapes. The WriteHeader spam
-      # was caused by the :8889 Prometheus *exporter* (now removed), not this
-      # server, so the classic `address` form is both correct and spam-free.
       level: normal
       address: 0.0.0.0:8888
   pipelines:
-    metrics:
-      receivers: [otlp, prometheus]
-      processors: [batch]
-      exporters: [debug]
     traces:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [debug]
+      processors: [batch, resource]
+      exporters: [debug, otlp/tempo]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [batch, resource]
+      exporters: [debug, prometheusremotewrite]
     logs:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [debug]
+      processors: [batch, resource]
+      exporters: [debug, loki]

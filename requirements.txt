@@ -15,6 +15,15 @@
 kafka-python-ng==2.2.3        # Kafka producer/consumer (pipeline/kafka_io.py)
 pyspark==3.5.1                # Spark aggregation (best-effort; ETL runs without it too)
 
+# --- OpenTelemetry zero-code auto-instrumentation ---
+# Install these on the host to run services locally with `opentelemetry-instrument`.
+# In Docker they are baked into the image via airflow/Dockerfile.
+#
+# After installing, run:  opentelemetry-bootstrap -a install
+# Then launch any service: opentelemetry-instrument python run_demo.py
+opentelemetry-distro==0.48b0
+opentelemetry-exporter-otlp-proto-http==1.27.0
+
 # --- Optional ML grounding for the vector memory (safe to omit) ---
 # numpy>=1.26
 # scikit-learn>=1.3
