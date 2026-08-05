@@ -140,21 +140,9 @@ def open_predicted_incident_issue(prediction: dict, decision: dict,
               "(set GITHUB_TOKEN + GITHUB_REPOSITORY to enable)")
         return None
 
-    existing_url, existing_num = find_open_issue(sig)
-    if existing_url:
-        # Keep a REUSED ticket fresh: overwrite its body with the latest AI-written
-        # RCA so it is never a stale, repeated template (the de-dupe used to return
-        # the old body verbatim, which is why every issue looked identical).
-        if rca and rca.get("root_cause") and existing_num:
-            _req("PATCH", f"/repos/{config.GITHUB_REPOSITORY}/issues/{existing_num}",
-                 {"body": _issue_body(prediction, decision, sig, rca)})
-            audit_trail.audit("governance_issue_refreshed", signature=sig, url=existing_url)
-            print(f"    -> [governance] predicted-incident issue refreshed (AI-written): {existing_url}")
-        else:
-            audit_trail.audit("governance_issue_deduped", signature=sig, url=existing_url)
-            print(f"    -> [governance] predicted-incident issue already open: {existing_url}")
-        return existing_url
-
+    # Brand-new each incident: file a FRESH issue every episode (no reuse/patch of a
+    # prior open ticket), per the demo governance model. Per-tick spam is prevented
+    # upstream — governance fires once per incident episode, not every tick.
     _ensure_label()
     repo = config.GITHUB_REPOSITORY
     title = (f"[{decision.get('level')}] Predicted: "
@@ -307,7 +295,8 @@ def open_preventive_pr(prediction: dict, decision: dict,
     there is no code change, so NO pull request is opened — the concrete ops steps
     live in the issue instead. De-dupes per signature; NEVER auto-merged."""
     sig = signature(prediction)
-    branch = f"guardian/fix-{sig}"
+    ep = "".join(c for c in str(decision.get("episode") or "") if c.isalnum())
+    branch = f"guardian/fix-{sig}-{ep}" if ep else f"guardian/fix-{sig}"
     if not enabled():
         audit_trail.audit("governance_pr_planned", signature=sig, enabled=False)
         print("    -> [governance] would open a gated code-fix PR — human approves")

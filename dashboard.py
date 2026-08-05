@@ -978,7 +978,17 @@ def render_html() -> str:
             action = (f'<div class="appr ok">✓ Approved by you — AI-written governed issue / PR filed.{links}'
                       + apply_html + '</div>')
         else:
-            action = (f'<div class="bnr-sub">{links}</div>' if links else '') + apply_html
+            if links:
+                action = ('<div class="appr ok">🤖 <b>AI auto-raised this incident.</b> '
+                          'The governed issue'
+                          + (' + gated code-fix PR' if banner.get("pr_url") else '')
+                          + ' was filed automatically — review &amp; <b>merge the PR</b> to '
+                          'productionize the fix, or <b>Apply fix</b> below to recover the live '
+                          'pipeline now.' + links + '</div>' + apply_html)
+            else:
+                action = ('<div class="appr">🤖 <b>AI is auto-filing the GitHub issue</b> '
+                          '(+ a gated code-fix PR if this needs a code change)… no approval '
+                          'needed. You can <b>Apply fix</b> below now.' + apply_html)
         banner_body = (
             f'<div class="bnr-sub">Predicted <b>{_esc(pred.get("predicted_failure_type", "failure"))}</b>'
             f' — risk {_esc(pred.get("risk_score"))}/100, ~{_esc(pred.get("lead_time_minutes"))} min lead time.</div>'

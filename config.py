@@ -153,7 +153,7 @@ CHAT_USE_LLM = os.environ.get("CHAT_USE_LLM", "true").lower() in ("1", "true", "
 # dashboard. Set false to let it file the governed (still never auto-merged)
 # artifacts automatically. Either way, nothing is ever merged/fixed without a human.
 GOVERNANCE_REQUIRE_APPROVAL = os.environ.get(
-    "GOVERNANCE_REQUIRE_APPROVAL", "true").lower() in ("1", "true", "yes")
+    "GOVERNANCE_REQUIRE_APPROVAL", "false").lower() in ("1", "true", "yes")
 
 
 # Tardis / Chatflow brain (production seam).

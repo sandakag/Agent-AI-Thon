@@ -110,9 +110,8 @@ def emit(tick: int, prediction: dict, decision: dict) -> None:
             threading.Thread(target=_annotate_async,
                              args=(prediction, decision, level), daemon=True).start()
             if not REQUIRE_APPROVAL:
-                threading.Thread(target=_govern_async,
-                                 args=(prediction, decision, level, _latest_rca()),
-                                 daemon=True).start()
+                threading.Thread(target=_auto_file_governance,
+                                 args=(prediction, level), daemon=True).start()
 
 
 def _annotate_async(prediction: dict, decision: dict, level: str) -> None:
@@ -185,6 +184,37 @@ def _grounded_rca(prediction: dict) -> dict:
     return rca_mod.generate_rca(prediction, sig, None)
 
 
+def _build_governed(prediction: dict, level: str) -> tuple[dict, dict | None]:
+    """Assemble the governed decision (+ AI RCA) for an ACTIVE incident: ALWAYS file
+    the issue; open a code-fix PR ONLY when the RCA says the root cause is a code
+    bug. A short per-episode token (derived from the banner's open time) makes every
+    fresh incident file BRAND-NEW artifacts instead of reusing a prior episode's."""
+    cur_sig = github_gov.signature(prediction)
+    rca = _latest_rca()
+    if not (rca and rca.get("signature") == cur_sig):
+        rca = _grounded_rca(prediction)
+    fix_type = str((rca or {}).get("fix_type") or "").lower()
+    opened = str(_read_banner().get("opened") or datetime.now(timezone.utc).isoformat())
+    episode = "".join(c for c in opened if c.isdigit())[-12:]
+    decision = {
+        "level": level,
+        "should_alert": True,
+        "should_open_issue": True,
+        "should_open_pr": (fix_type == "code"),
+        "episode": episode,
+        "recommendation": prediction.get("recommended_action", ""),
+    }
+    return decision, rca
+
+
+def _auto_file_governance(prediction: dict, level: str) -> None:
+    """Auto-file the governed artifacts on detection (NO approval): the AI-written
+    issue always, and the gated code-fix PR only when a code change is needed. The
+    human still reviews/merges the PR or clicks Apply fix — filing is not fixing."""
+    decision, rca = _build_governed(prediction, level)
+    _govern_async(prediction, decision, level, rca)
+
+
 def approve_active_incident() -> dict:
     """Operator approval from the dashboard: file the governed GitHub issue / gated
     PR (AI-written) + Grafana IRM incident for the ACTIVE incident. Nothing is filed
@@ -197,25 +227,7 @@ def approve_active_incident() -> dict:
         return {"status": "already_approved",
                 "issue_url": banner.get("issue_url"), "pr_url": banner.get("pr_url")}
     prediction = banner.get("prediction") or {}
-    # Attach the AI analysis for THIS incident. The loop's newest RCA can still be
-    # for a PREVIOUS incident (the new one's Opus RCA may not have generated yet),
-    # so only use it when its signature matches; otherwise generate a grounded RCA
-    # for the current prediction NOW (instant) so the issue/PR are never stale or
-    # a bare template.
-    cur_sig = github_gov.signature(prediction)
-    rca = _latest_rca()
-    if not (rca and rca.get("signature") == cur_sig):
-        rca = _grounded_rca(prediction)
-    # Raise a PR ONLY when a code/logic change is needed; a purely operational
-    # (manual) fix gets the step-by-step guidance in the issue, with no PR.
-    fix_type = str((rca or {}).get("fix_type") or "").lower()
-    decision = {
-        "level": level,
-        "should_alert": True,
-        "should_open_issue": True,
-        "should_open_pr": (fix_type == "code"),
-        "recommendation": prediction.get("recommended_action", ""),
-    }
+    decision, rca = _build_governed(prediction, level)
     issue_url, pr_url = _govern_async(prediction, decision, level, rca)
     banner = _read_banner()
     banner["approved"] = True
