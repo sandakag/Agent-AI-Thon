@@ -147,12 +147,14 @@ CHAT_LOG = config.DATA_DIR / "chat_log.json"
 PENDING_INCIDENT = config.DATA_DIR / "pending_incident.json"
 
 _CHAT_SYSTEM = (
-    "You are the assistant for a Predictive Pipeline Guardian — an AI SRE that "
-    "PREDICTS data-pipeline failures BEFORE they happen. Answer the operator's "
-    "question about the LIVE pipeline using ONLY the telemetry provided. Be "
-    "concise, concrete and forward-looking: what is likely to break, WHEN (lead "
-    "time), WHY (which signals), and how to PREVENT it. If the telemetry does not "
-    "support an answer, say so plainly. Never invent numbers."
+    "You are the assistant for a Predictive Pipeline Guardian — an expert AI SRE "
+    "that PREDICTS data-pipeline failures BEFORE they happen. Answer the operator's "
+    "question about the LIVE pipeline using ONLY the telemetry provided. Explain the "
+    "reasoning clearly: what is likely to break, WHEN (lead time), WHY (which signals "
+    "and the failure mechanism), the IMPACT (SLA / revenue / customers), and concrete "
+    "step-by-step remediation and PREVENTION. Prefer a thorough, well-structured "
+    "explanation when the question warrants it, but never pad or invent numbers. If "
+    "the telemetry does not support an answer, say so plainly."
 )
 
 _brain = None
@@ -184,16 +186,240 @@ def _chat_save(turns: list) -> None:
         pass
 
 
-def _chat_context() -> dict:
-    s = build_summary()
-    signals = {}
+def _signal_history(n: int = 12) -> list:
+    """The recent rolling signal window the live engine persists."""
     if config.SIGNAL_HISTORY_FILE.exists():
         try:
             hist = json.loads(config.SIGNAL_HISTORY_FILE.read_text(encoding="utf-8"))
-            if hist:
-                signals = hist[-1]
+            if isinstance(hist, list):
+                return hist[-n:]
         except (json.JSONDecodeError, OSError):
             pass
+    return []
+
+
+def _series(hist: list, field: str) -> list:
+    return [h[field] for h in hist
+            if isinstance(h, dict) and isinstance(h.get(field), (int, float))]
+
+
+def _slope(series: list) -> float:
+    """Least-squares slope of a short series vs its index (0 if < 3 points)."""
+    n = len(series)
+    if n < 3:
+        return 0.0
+    xs = list(range(n))
+    mx = sum(xs) / n
+    my = sum(series) / n
+    denom = sum((x - mx) ** 2 for x in xs) or 1e-9
+    return sum((xs[i] - mx) * (series[i] - my) for i in range(n)) / denom
+
+
+def _sla_view(hist: list) -> dict:
+    """Turn the live latency window into a plain-English SLA verdict + ETA."""
+    lat = _series(hist, "latency_ms")
+    cur = lat[-1] if lat else None
+    soft = config.SLA_LATENCY_MS
+    hard = config.LATENCY_TIMEOUT_MS
+    slope = _slope(lat[-8:]) if len(lat) >= 3 else 0.0
+    eta = None
+    verdict = "unknown"
+    if cur is not None:
+        if cur >= hard:
+            verdict = "BREACHING (past the hard timeout)"
+        elif cur >= soft:
+            verdict = "AT RISK (over the soft SLA)"
+        elif slope > 1 and cur > soft * 0.4:
+            verdict = "approaching the SLA"
+        else:
+            verdict = "within SLA"
+        if slope > 1e-6 and cur < hard:
+            eta = round((hard - cur) / slope, 1)
+    return {
+        "current_ms": round(cur, 1) if cur is not None else None,
+        "soft_sla_ms": soft,
+        "hard_ceiling_ms": hard,
+        "trend_ms_per_tick": round(slope, 1),
+        "verdict": verdict,
+        "ticks_to_breach": eta,
+    }
+
+
+def _sparkline(series: list, w: int = 260, h: int = 46, color: str = "#58a6ff",
+               thresholds=None, vmin=None, vmax=None) -> str:
+    """A tiny dependency-free inline-SVG sparkline (no JS, no libraries).
+
+    ``thresholds`` is a list of ``(value, color)`` dashed reference lines — used
+    to draw the SLA / hard-timeout lines on the latency trend so a breach is
+    obvious at a glance.
+    """
+    pts = [float(x) for x in series if isinstance(x, (int, float))][-40:]
+    if len(pts) < 2:
+        return (f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+                f'<text x="6" y="{h // 2 + 4}" fill="#6e7681" font-size="11">'
+                'warming up…</text></svg>')
+    lo = vmin if vmin is not None else min(pts)
+    hi = vmax if vmax is not None else max(pts)
+    hi = max(hi, max(pts))
+    lo = min(lo, min(pts))
+    rng = (hi - lo) or 1.0
+    n = len(pts)
+
+    def xy(i: int, v: float):
+        x = i * (w - 4) / (n - 1) + 2
+        y = h - 3 - ((v - lo) / rng) * (h - 8)
+        return x, y
+
+    coords = [xy(i, v) for i, v in enumerate(pts)]
+    poly = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
+    tl = ""
+    for tval, tcol in (thresholds or []):
+        if lo <= tval <= hi:
+            _, ty = xy(0, tval)
+            tl += (f'<line x1="0" y1="{ty:.1f}" x2="{w}" y2="{ty:.1f}" stroke="{tcol}" '
+                   f'stroke-width="1" stroke-dasharray="3,3" opacity="0.75"/>')
+    lx, ly = coords[-1]
+    return (f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
+            'preserveAspectRatio="none">'
+            f'{tl}<polyline fill="none" stroke="{color}" stroke-width="2" '
+            f'points="{poly}"/>'
+            f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="2.6" fill="{color}"/></svg>')
+
+
+def _sla_color(verdict: str) -> str:
+    v = (verdict or "").lower()
+    if "breach" in v:
+        return "#f85149"
+    if "at risk" in v or "approach" in v:
+        return "#d98c00"
+    if "within" in v:
+        return "#3fb950"
+    return "#8b949e"
+
+
+def _render_realtime(sla: dict, lat_series: list, risk_series: list,
+                     rec_series: list, hist: list) -> str:
+    """The real-time monitoring strip: latency-vs-SLA, predicted-risk and
+    throughput/quality, each with a live sparkline — so an operator sees the
+    pipeline breathing and a breach coming, not just static counters."""
+    soft = sla.get("soft_sla_ms") or 4000
+    hard = sla.get("hard_ceiling_ms") or 9000
+    cur = sla.get("current_ms")
+    verdict = sla.get("verdict", "unknown")
+    scol = _sla_color(verdict)
+    eta = sla.get("ticks_to_breach")
+    trend = sla.get("trend_ms_per_tick", 0.0)
+    lat_vals = [x for x in lat_series if isinstance(x, (int, float))]
+    lat_max = max([hard * 1.05] + lat_vals) if lat_vals else hard * 1.05
+    lat_spark = _sparkline(lat_series, color=scol,
+                           thresholds=[(soft, "#d98c00"), (hard, "#f85149")],
+                           vmin=0, vmax=lat_max)
+    cur_txt = f"{cur:.0f} ms" if cur is not None else "– ms"
+    if trend > 1 and eta is not None and (cur is None or cur < hard):
+        eta_txt = f" · ~{eta:.0f} ticks to breach"
+    elif trend > 1:
+        eta_txt = " · climbing"
+    elif trend < -1:
+        eta_txt = " · easing"
+    else:
+        eta_txt = ""
+
+    latest_risk = risk_series[-1] if risk_series else None
+    rv = latest_risk or 0
+    rlevel = "RED" if rv >= config.RISK_RED else ("AMBER" if rv >= config.RISK_AMBER else "GREEN")
+    rcol = _COLOR.get(rlevel, "#1f9d55")
+    risk_spark = _sparkline(risk_series, color=rcol,
+                            thresholds=[(config.RISK_AMBER, "#d98c00"),
+                                        (config.RISK_RED, "#f85149")],
+                            vmin=0, vmax=100)
+
+    latest_sig = hist[-1] if hist else {}
+    rc = latest_sig.get("record_count")
+    nr = latest_sig.get("null_rate")
+    drift = latest_sig.get("schema_drift")
+    rec_spark = _sparkline(rec_series, color="#58a6ff", vmin=0)
+    drift_badge = ('<span class="pill" style="background:#c0392b">SCHEMA DRIFT</span>'
+                   if drift else '<span class="pill" style="background:#1f9d55">no drift</span>')
+    nr_txt = f"{nr * 100:.0f}%" if isinstance(nr, (int, float)) else "–"
+    rc_txt = rc if rc is not None else "–"
+
+    return (
+        '<div class="sec">📈 Live SLA &amp; signal trends (auto-refresh ~5s)</div>'
+        '<div class="grid3">'
+        f'<div class="panel sp"><div class="l">Processing latency vs SLA</div>'
+        f'<div class="v" style="color:{scol}">{cur_txt}</div>'
+        f'<div class="s">soft {soft:.0f}ms · hard {hard:.0f}ms · '
+        f'<b style="color:{scol}">{_esc(verdict)}</b>{eta_txt}</div>'
+        f'<div class="spark">{lat_spark}</div>'
+        '<div class="s muted">orange = soft SLA · red = hard timeout ceiling</div></div>'
+        f'<div class="panel sp"><div class="l">Predicted risk (0–100)</div>'
+        f'<div class="v" style="color:{rcol}">{latest_risk if latest_risk is not None else "–"}</div>'
+        f'<div class="s">amber ≥ {config.RISK_AMBER:.0f} · red ≥ {config.RISK_RED:.0f} — '
+        'the agent fires BEFORE the break</div>'
+        f'<div class="spark">{risk_spark}</div></div>'
+        f'<div class="panel sp"><div class="l">Throughput &amp; data quality</div>'
+        f'<div class="v">{rc_txt} <span style="font-size:13px;color:#8b949e">records/run</span></div>'
+        f'<div class="s">null-rate {nr_txt} · {drift_badge}</div>'
+        f'<div class="spark">{rec_spark}</div></div>'
+        '</div>'
+    )
+
+
+def _load_rca() -> dict | None:
+    """The latest Opus-authored (or grounded) RCA the live engine produced."""
+    f = config.DATA_DIR / "latest_rca.json"
+    if f.exists():
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(d, dict) and d.get("root_cause"):
+                return d
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+def _render_rca_html() -> str:
+    rca = _load_rca()
+    if not rca:
+        return ""
+
+    def lis(items) -> str:
+        return "".join(f"<li>{_esc(i)}</li>" for i in (items or [])) \
+            or '<li class="muted">(none)</li>'
+
+    lvl = str(rca.get("level") or "AMBER").upper()
+    col = _COLOR.get(lvl, "#d98c00")
+    src = str(rca.get("source") or "llm")
+    badge = ("Claude Opus 4.8" if "opus" in src.lower()
+             else "grounded heuristic" if "heuristic" in src.lower() else _esc(src))
+    analysis = _esc(rca.get("detailed_analysis", "")).replace("\n", "<br>")
+    return (
+        '<div class="sec">🔬 AI Root-Cause Analysis '
+        f'<span class="pill" style="background:{col}">{_esc(lvl)}</span> '
+        f'<span class="pill" style="background:#30363d">{badge}</span></div>'
+        '<div class="panel">'
+        f'<div style="font-size:15px;font-weight:700;margin-bottom:4px">{_esc(rca.get("title", ""))}</div>'
+        f'<div class="s" style="margin-bottom:8px">{_esc(rca.get("summary", ""))}</div>'
+        f'<div><b>Root cause:</b> {_esc(rca.get("root_cause", ""))}</div>'
+        f'<div style="margin-top:8px"><b>Detailed analysis</b>'
+        f'<div class="a" style="margin-top:4px">{analysis}</div></div>'
+        '<div class="rcagrid">'
+        f'<div><b>Timeline</b><ol>{lis(rca.get("timeline"))}</ol></div>'
+        f'<div><b>Immediate actions (on-call)</b><ul>{lis(rca.get("immediate_actions"))}</ul></div>'
+        f'<div><b>Preventive measures</b><ul>{lis(rca.get("preventive_measures"))}</ul></div>'
+        f'<div><b>Impact</b><div class="a">{_esc(rca.get("impact", ""))}</div>'
+        f'<b>Evidence</b><ul>{lis(rca.get("evidence"))}</ul></div>'
+        '</div>'
+        f'<div class="muted" style="margin-top:6px">Generated {_esc((rca.get("generated_at") or "")[11:19])} UTC'
+        f' · confidence {_esc(rca.get("confidence", ""))}</div>'
+        '</div>'
+    )
+
+
+def _chat_context() -> dict:
+    s = build_summary()
+    hist = _signal_history(12)
+    signals = hist[-1] if hist else {}
     last = s.get("last") or {}
     return {
         "banner_level": (s.get("banner") or {}).get("level"),
@@ -208,6 +434,8 @@ def _chat_context() -> dict:
             "brain": last.get("source"),
         },
         "latest_signals": signals,
+        "sla": _sla_view(hist),
+        "root_cause_analysis": _load_rca(),
         "recent_failure_types": [p.get("predicted_failure_type")
                                  for p in s.get("recent_predictions", [])][:8],
         "totals": s.get("totals"),
@@ -215,28 +443,219 @@ def _chat_context() -> dict:
     }
 
 
-def _fallback_answer(ctx: dict) -> str:
+# --- Remediation playbook (used by the grounded assistant + shown in answers) --
+def _remediation_for(failure_type: str) -> str:
+    ft = (failure_type or "").lower()
+    if "schema" in ft:
+        return ("resolve the renamed/aliased field and quarantine the bad records "
+                "before load, so the parser stops dropping rows.")
+    if "latency" in ft or "timeout" in ft or "load" in ft:
+        return _latency_remediation()
+    if "null" in ft or "quality" in ft:
+        return ("quarantine + repair the malformed records and resolve field aliases "
+                "before load — the batch is trending toward the null-rate line that "
+                "zeroes revenue.")
+    if "stall" in ft or "throughput" in ft or "volume" in ft:
+        return ("check the upstream producer / consumer lag, scale consumers and "
+                "backfill the window before the batch starves.")
+    if "anomaly" in ft or "source" in ft or "outage" in ft:
+        return ("investigate the flagged signal against recent upstream / deploy "
+                "changes, confirm the deviation is real, then contain the source "
+                "before it breaches.")
+    return "keep monitoring; no action is needed yet."
+
+
+def _latency_remediation() -> str:
+    return ("scale out the ETL consumers and raise parallelism, add backpressure, "
+            "and chunk the batch so processing time stays under the SLA before the "
+            "load-timeout aborts the pipeline.")
+
+
+def _full_status(ctx: dict) -> str:
     p = ctx.get("latest_prediction") or {}
-    lvl = ctx.get("banner_level") or "GREEN"
-    parts = [f"[grounded answer — AI brain offline] Status {lvl}, risk "
-             f"{p.get('risk_score')}/100."]
+    sig = ctx.get("latest_signals") or {}
+    sla = ctx.get("sla") or {}
+    lvl = (ctx.get("banner_level") or "GREEN").upper()
     ft = p.get("predicted_failure_type")
+    bits = [f"Status {lvl} · risk {p.get('risk_score')}/100"]
+    if sla.get("current_ms") is not None:
+        bits.append(f"latency {sla['current_ms']:.0f}ms/{sla['soft_sla_ms']:.0f} SLA")
+    if isinstance(sig.get("null_rate"), (int, float)):
+        bits.append(f"null {sig['null_rate'] * 100:.0f}%")
+    if sig.get("record_count") is not None:
+        bits.append(f"{sig['record_count']} records")
+    line = " · ".join(bits) + "."
     if ft and ft != "none":
-        parts.append(f"Predicted failure: {ft} (~{p.get('lead_time_minutes')} min lead).")
-    ev = p.get("evidence") or []
-    if ev:
-        parts.append("Why: " + "; ".join(str(e) for e in ev[:3]) + ".")
-    if p.get("recommended_action"):
-        parts.append(f"Prevention: {p['recommended_action']}")
-    if lvl == "GREEN":
-        parts.append("Nothing is failing now; the guardian is watching the trends.")
-    return " ".join(parts)
+        line += (f" Predicting {ft} ~{p.get('lead_time_minutes')} min out — "
+                 f"{p.get('recommended_action') or _remediation_for(ft)}")
+    else:
+        line += " No failure predicted; every signal is inside its normal band."
+    return line
+
+
+_GREETINGS = ("hi", "hello", "hey", "yo", "hola", "howdy", "hiya", "sup", "gm",
+              "good morning", "good afternoon", "good evening", "namaste")
+
+
+def _grounded_answer(q: str, ctx: dict) -> str:
+    """A genuinely useful, conversational answer grounded ONLY in live telemetry.
+
+    Runs whenever the LLM brain isn't reachable (e.g. a headless container). It
+    reads the operator's actual question, routes it to the right slice of the
+    telemetry, and answers concretely — so "hello", "what will break?", and
+    "are we over SLA?" each get a distinct, grounded reply.
+    """
+    ql = " ".join(q.lower().split())
+    p = ctx.get("latest_prediction") or {}
+    sig = ctx.get("latest_signals") or {}
+    sla = ctx.get("sla") or {}
+    lvl = (ctx.get("banner_level") or "GREEN").upper()
+    ft = p.get("predicted_failure_type")
+    has_pred = bool(ft and ft != "none")
+    risk = p.get("risk_score")
+    lead = p.get("lead_time_minutes")
+
+    def has(*words) -> bool:
+        return any(w in ql for w in words)
+
+    # greetings / thanks -------------------------------------------------------
+    if ql in ("thanks", "thank you", "ty", "thx"):
+        return "Anytime! " + _full_status(ctx) + " Ask me what's most likely to break, when, or how to prevent it."
+    if any(ql == g or ql.startswith(g + " ") or ql.startswith(g + "!") for g in _GREETINGS):
+        return ("Hey — I'm the Predictive Pipeline Guardian. " + _full_status(ctx) +
+                " You can ask me “what's the biggest risk right now and when will it break?”, "
+                "“are we breaching the latency SLA?”, or “what should the on-call do?”")
+
+    # help ---------------------------------------------------------------------
+    if has("what can you", "how do you work", "what do you do") or ql in ("help", "?", "commands"):
+        return ("I forecast data-pipeline failures BEFORE they happen from the live signals. Try:\n"
+                f"• what's the biggest risk right now and when will it break?\n"
+                f"• are we within our latency SLA? (soft {sla.get('soft_sla_ms', 4000):.0f}ms / hard {sla.get('hard_ceiling_ms', 9000):.0f}ms)\n"
+                f"• what should the on-call do to prevent it?\n"
+                f"• how's data quality / throughput / revenue?\n"
+                "Then inject an incident below and watch me catch it early.")
+
+    # SLA / latency ------------------------------------------------------------
+    if has("sla", "latency", "slow", "response time", "timeout", "how fast", "lag"):
+        cur = sla.get("current_ms")
+        if cur is None:
+            return "No latency reading yet — give the live engine a few seconds to warm up, then ask again."
+        soft = sla.get("soft_sla_ms"); hard = sla.get("hard_ceiling_ms")
+        trend = sla.get("trend_ms_per_tick", 0.0); eta = sla.get("ticks_to_breach")
+        parts = [f"Processing latency is **{cur:.0f} ms** vs a {soft:.0f} ms soft SLA and a "
+                 f"{hard:.0f} ms hard timeout — **{sla.get('verdict', 'unknown')}**."]
+        if trend > 1:
+            parts.append(f"It's climbing ~{trend:.0f} ms/tick.")
+            if eta is not None and cur < hard:
+                parts.append(f"At this rate it hits the {hard:.0f} ms ceiling in ~{eta:.0f} ticks — "
+                             "the point the load stage aborts the batch.")
+            parts.append("Prevention: " + _latency_remediation())
+        elif trend < -1:
+            parts.append(f"It's easing (~{abs(trend):.0f} ms/tick) — recovering toward normal.")
+        else:
+            parts.append("It's stable.")
+        return " ".join(parts)
+
+    # deep explanation / root-cause analysis ----------------------------------
+    if has("rca", "root cause", "root-cause", "explain", "deep dive", "detailed",
+           "analysis", "analyse", "analyze", "walk me through", "break it down"):
+        rca = ctx.get("root_cause_analysis")
+        if rca and rca.get("detailed_analysis"):
+            parts = [f"**{rca.get('title', 'Root-cause analysis')}** — {rca.get('summary', '')}",
+                     f"**Root cause:** {rca.get('root_cause', '')}",
+                     rca.get("detailed_analysis", "")]
+            im = rca.get("immediate_actions") or []
+            pv = rca.get("preventive_measures") or []
+            if im:
+                parts.append("**Immediate actions:** " + "; ".join(str(x) for x in im))
+            if pv:
+                parts.append("**Prevention:** " + "; ".join(str(x) for x in pv))
+            return "\n\n".join(str(p) for p in parts if p)
+        if not has_pred and lvl == "GREEN":
+            return ("No incident is active, so there's no root-cause analysis yet. The "
+                    "pipeline is GREEN and every signal is inside its normal band. Inject "
+                    "an incident and I'll produce a full RCA (Opus 4.8) — root cause, "
+                    "timeline, impact and prevention.")
+
+    # remediation / action -----------------------------------------------------
+    if has("what should", "what do i do", "how to prevent", "how do i fix", "remediat",
+           "measures", "mitigat", "recommend", "prevent", "avoid", "action", "steps"):
+        if not has_pred and lvl == "GREEN":
+            return (_full_status(ctx) + " No action needed yet — keep monitoring. "
+                    "Inject an incident below to see the exact remediation I'd hand the on-call.")
+        why = "; ".join(str(e) for e in (p.get("evidence") or [])[:3])
+        return (f"Predicted **{ft}** at risk {risk}/100 (~{lead} min lead). "
+                + (f"Why: {why}. " if why else "")
+                + "Recommended action: " + (p.get("recommended_action") or _remediation_for(ft)))
+
+    # biggest risk / when will it break ---------------------------------------
+    if has("risk", "break", "fail", "when", "worst", "biggest", "danger", "incident",
+           "predict", "happen", "wrong"):
+        if not has_pred and lvl == "GREEN":
+            return (f"No failure is predicted right now — the pipeline is GREEN (risk {risk}/100) and every "
+                    "signal is inside its normal band. The instant one starts drifting I'll tell you exactly "
+                    "what will break, when, and how to stop it.")
+        why = "; ".join(str(e) for e in (p.get("evidence") or [])[:3])
+        conf = p.get("confidence")
+        return (f"Biggest risk: **{ft}** — risk {risk}/100"
+                + (f", confidence {conf}." if conf is not None else ".")
+                + (f" ~{lead} min of lead time before it would break." if lead else "")
+                + (f" Signals driving it: {why}." if why else "")
+                + " To prevent it: " + (p.get("recommended_action") or _remediation_for(ft)))
+
+    # data quality / null ------------------------------------------------------
+    if has("null", "data quality", "missing", "quality", "empty", "corrupt"):
+        nr = sig.get("null_rate")
+        if not isinstance(nr, (int, float)):
+            return "No data-quality reading yet."
+        crit = config.NULL_RATE_CRITICAL
+        v = "critical" if nr >= crit else ("elevated" if nr >= crit * 0.5 else "healthy")
+        return (f"Null-amount rate is **{nr * 100:.0f}%** ({v}). The load stage refuses to publish above "
+                f"{crit * 100:.0f}% — that would silently report $0 revenue, so I flag it well before then.")
+
+    # throughput / volume / transactions --------------------------------------
+    if has("throughput", "volume", "records", "traffic", "transaction", "how many", "starv"):
+        rc = sig.get("record_count")
+        if rc is None:
+            return "No throughput reading yet."
+        mn = config.MIN_RECORDS
+        v = "starved" if rc < mn else "healthy"
+        tp = sig.get("throughput_rps")
+        return (f"The last run processed **{rc} records** ({v}; the starvation line is {mn})"
+                + (f" at ~{tp} rec/s" if isinstance(tp, (int, float)) else "")
+                + f". Distinct products seen: {sig.get('distinct_products', '?')}.")
+
+    # revenue ------------------------------------------------------------------
+    if has("revenue", "money", "dollar", "earning", "sales", "$"):
+        rev = (ctx.get("totals") or {}).get("revenue") or 0
+        last_rev = sig.get("revenue")
+        return (f"Warehouse revenue total is **${rev:,.0f}**"
+                + (f"; the last ETL run added ${last_rev:,.0f}." if isinstance(last_rev, (int, float)) else "."))
+
+    # drift / schema -----------------------------------------------------------
+    if has("drift", "schema", "field", "format", "structure"):
+        return ("**Schema drift detected** — an upstream field changed shape and the parser will start "
+                "dropping records. Resolve the field aliases before the null-rate zeroes revenue."
+                if sig.get("schema_drift")
+                else "No schema drift — the upstream field layout matches the learned baseline.")
+
+    # audit --------------------------------------------------------------------
+    if has("audit", "integrity", "tamper", "chain", "trail"):
+        return ("The audit hash-chain is **intact** — every prediction, warning and governed action is "
+                "tamper-evident." if ctx.get("audit_intact")
+                else "The audit hash-chain is **BROKEN** — a record was altered; investigate immediately.")
+
+    # health / status / catch-all ---------------------------------------------
+    if has("health", "status", "how are", "everything ok", "are we ok", "summary", "overview", "doing"):
+        return _full_status(ctx)
+
+    return _full_status(ctx) + " (Ask me about risk, the latency SLA, data quality, throughput, revenue, or what to do.)"
 
 
 def _answer_question(q: str) -> str:
     q = (q or "").strip()[:500]
     if not q:
-        return "Ask about the pipeline's risk, what's likely to fail, when, or why."
+        return "Ask about the pipeline's risk, what's likely to fail, when, or how to prevent it."
     ctx = _chat_context()
     brain = _get_brain()
     if brain is not None and getattr(brain, "available", False):
@@ -244,18 +663,22 @@ def _answer_question(q: str) -> str:
                 f"{json.dumps(ctx, default=str)}")
         try:
             reply = brain.chat(_CHAT_SYSTEM, user).strip()
-            return reply or _fallback_answer(ctx)
+            return reply or _grounded_answer(q, ctx)
         except BrainError:
-            return _fallback_answer(ctx)
+            return _grounded_answer(q, ctx)
         except Exception:  # noqa: BLE001 - a chat hiccup must never crash the dashboard
-            return _fallback_answer(ctx)
-    return _fallback_answer(ctx)
+            return _grounded_answer(q, ctx)
+    return _grounded_answer(q, ctx)
 
 
 def _write_pending_incident(payload: dict) -> dict:
     if payload.get("reset"):
+        # Write a reset SENTINEL (not just delete): the always-on guardian engine
+        # consumes it on its next tick, stands the fault down and clears the
+        # banner, so pressing "Clear" visibly returns the pipeline to healthy.
         try:
-            PENDING_INCIDENT.unlink(missing_ok=True)
+            PENDING_INCIDENT.write_text(json.dumps({"reset": True, "label": "clear"}),
+                                        encoding="utf-8")
         except OSError:
             pass
         return {"status": "cleared"}
@@ -368,6 +791,23 @@ function induceCustom(){
   var ops; try{ops=JSON.parse(raw);}catch(e){alert('ops must be a valid JSON array');return;}
   induce({label:label,ops:ops});
 }
+// Live auto-refresh (replaces the old <meta refresh>): reload every 5s, but NEVER
+// while you're focused on / recently typing in the chat or custom-incident boxes,
+// so your text is never wiped mid-question.
+(function(){
+  var FIELDS=['gq','incops','inclabel'], GRACE=30000, last=0;
+  function touch(){last=Date.now();}
+  FIELDS.forEach(function(id){
+    var el=document.getElementById(id);
+    if(el){el.addEventListener('input',touch);el.addEventListener('keydown',touch);el.addEventListener('focus',touch);}
+  });
+  function busy(){
+    var ae=document.activeElement;
+    for(var i=0;i<FIELDS.length;i++){if(document.getElementById(FIELDS[i])===ae)return true;}
+    return (Date.now()-last)<GRACE;
+  }
+  setInterval(function(){if(!busy())location.reload();},5000);
+})();
 </script>
 """
 
@@ -381,6 +821,16 @@ def render_html() -> str:
     color = _COLOR.get(level, "#1f9d55")
     banner = s["banner"] or {}
     pred = banner.get("prediction", {}) if isinstance(banner, dict) else {}
+
+    # Real-time monitoring strip — latency vs SLA, risk trend, throughput/quality
+    hist = _signal_history(40)
+    sla = _sla_view(hist)
+    lat_series = _series(hist, "latency_ms")
+    rec_series = _series(hist, "record_count")
+    risk_series = [p.get("risk_score") for p in reversed(s["recent_predictions"])
+                   if isinstance(p.get("risk_score"), (int, float))]
+    realtime_html = _render_realtime(sla, lat_series, risk_series, rec_series, hist)
+    rca_html = _render_rca_html()
 
     def card(label: str, value: object, sub: str = "") -> str:
         return (f'<div class="card"><div class="v">{_esc(value)}</div>'
@@ -437,14 +887,14 @@ def render_html() -> str:
                               'live pipeline — e.g. “what is the biggest risk right now '
                               'and when will it break?”</div>')
     panels_html = (
-        '<div class="sec">💬 Ask the Guardian (GitHub Copilot brain)</div>'
+        '<div class="sec">💬 Ask the Guardian</div>'
         '<div class="panel">' + chat_rows +
         '<div class="row">'
         '<input id="gq" placeholder="what is the biggest risk right now and when will it break?" '
         "onkeydown=\"if(event.key==='Enter')askGuardian()\">"
         '<button id="gqbtn" onclick="askGuardian()">Ask</button></div>'
-        '<div class="muted" style="margin-top:6px">Grounded in live telemetry; '
-        'answers can take a few seconds (Copilot brain).</div></div>'
+        '<div class="muted" style="margin-top:6px">I read your question and answer from the '
+        'live telemetry (risk, the latency SLA, data quality, throughput, revenue, remediation).</div></div>'
         '<div class="sec">🧪 Induce your OWN incident (unknown to the AI)</div>'
         '<div class="panel"><div class="row">' + _INJECT_BUTTONS + '</div>'
         "<textarea id=\"incops\" placeholder='advanced: ops JSON array, e.g. "
@@ -452,13 +902,12 @@ def render_html() -> str:
         "{&quot;op&quot;:&quot;latency&quot;,&quot;ms&quot;:1200}]'></textarea>"
         '<div class="row"><input id="inclabel" placeholder="incident name (optional)">'
         '<button onclick="induceCustom()">Induce custom incident</button></div>'
-        '<div class="muted" style="margin-top:6px">Lands in the next live '
-        '<code>run_demo.py</code> tick. The agent is never told what you did — '
-        'watch it predict the failure.</div></div>'
+        '<div class="muted" style="margin-top:6px">Lands on the next tick of the always-on '
+        'guardian engine (a few seconds) and ramps from there. The agent is never told what '
+        'you did — watch it predict the failure BEFORE it breaks, then press <b>Clear</b> to recover.</div></div>'
     )
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
 <title>Predictive Pipeline Guardian</title>
 <style>
  body{{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0e1117;color:#e6edf3}}
@@ -468,6 +917,13 @@ def render_html() -> str:
  .bnr b{{font-weight:700}} .bnr-title{{font-size:18px;font-weight:700}} .bnr-sub{{margin-top:6px;font-size:13px;opacity:.95}}
  .bnr a{{color:#fff;text-decoration:underline}}
  .grid{{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:18px}}
+ .grid3{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}}
+ .panel.sp .v{{font-size:24px;font-weight:700}} .panel.sp .l{{color:#8b949e;font-size:11px}}
+ .panel.sp .s{{color:#8b949e;font-size:11px;margin-top:2px}}
+ .spark{{margin-top:8px}} .spark svg{{width:100%;height:46px;display:block}}
+ .rcagrid{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:10px}}
+ .rcagrid ul,.rcagrid ol{{margin:4px 0 0 18px;padding:0}} .rcagrid li{{font-size:12px;margin:2px 0;color:#c9d3de}}
+ .rcagrid>div>b{{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.04em}}
  .card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px}}
  .card .v{{font-size:22px;font-weight:700}} .card .l{{color:#8b949e;font-size:11px;margin-top:2px}} .card .s{{color:#6e7681;font-size:10px}}
  table{{width:100%;border-collapse:collapse;background:#161b22;border-radius:10px;overflow:hidden}}
@@ -492,6 +948,8 @@ def render_html() -> str:
  <h1>🔮 Predictive Pipeline Guardian</h1>
  <div class="sub">Predicts data-pipeline failures BEFORE they happen · GitHub Copilot brain · governed by a human · updated {_esc(s["generated_at"][11:19])} UTC</div>
  <div class="bnr"><div class="bnr-title">{_esc(level)}</div>{banner_body}</div>
+ {realtime_html}
+ {rca_html}
  <div class="grid">
    {card("Latest risk", f'{last.get("risk_score","–")}/100')}
    {card("Pipeline health", f'{last.get("pipeline_health","–")}/100')}

@@ -24,15 +24,12 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
-  prometheus:
-    config:
-      scrape_configs:
-        - job_name: guardian-scrape
-          scrape_interval: 10s
-          static_configs:
-            - targets: ["dashboard:8089"]
-              labels:
-                collected_by: otel-collector
+  # NOTE: the collector deliberately does NOT scrape the guardian /metrics
+  # endpoint. Prometheus already scrapes dashboard:8089 directly (see
+  # prometheus.yml). If the collector ALSO scraped it and remote-wrote the
+  # result back into Prometheus, every guardian_* metric would exist as TWO
+  # series (job="predictive-guardian" + the remote-written copy) and every
+  # Grafana stat/gauge would render the value TWICE. One scraper = one series.
 
 processors:
   batch:
@@ -88,7 +85,7 @@ service:
       processors: [batch, resource]
       exporters: [debug, otlp/tempo]
     metrics:
-      receivers: [otlp, prometheus]
+      receivers: [otlp]
       processors: [batch, resource]
       exporters: [debug, prometheusremotewrite]
     logs:

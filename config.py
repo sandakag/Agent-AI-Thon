@@ -124,6 +124,23 @@ COPILOT_CLI_FALLBACK_MODEL = os.environ.get("COPILOT_CLI_FALLBACK_MODEL", "auto"
 COPILOT_CLI_REASONING_EFFORT = os.environ.get("COPILOT_CLI_REASONING_EFFORT", "")
 COPILOT_CLI_TIMEOUT_SECONDS = int(os.environ.get("COPILOT_CLI_TIMEOUT_SECONDS", "120"))
 
+# GitHub Copilot REST API brain (Claude Opus 4.8) — the high-power reasoning
+# brain used for the detailed RCA and the operator chat. It talks to the Copilot
+# Chat API directly (like the VS Code extension) using your existing Copilot
+# subscription, so it can force a premium model and a large output budget that
+# the CLI's `--model` flag can't on some seats. Auth needs no PAT/API key — a
+# GitHub Copilot OAuth token is discovered from the environment, a token file, or
+# the official Copilot plugin config (see agent/copilot_api.py).
+COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "claude-opus-4.8")
+# Output budget for a single completion (Opus supports a large context; this caps
+# how long ONE answer/RCA can be). Set 0 to let the service pick its default.
+COPILOT_MAX_TOKENS = int(os.environ.get("COPILOT_MAX_TOKENS", "8000"))
+COPILOT_API_TIMEOUT = int(os.environ.get("COPILOT_API_TIMEOUT", "120"))
+# Optional explicit path to a Copilot OAuth token file ({"access_token": "..."}).
+# Used to hand the host's subscription token to the headless Docker containers.
+COPILOT_TOKEN_STORE = os.environ.get("COPILOT_TOKEN_STORE", "")
+
+
 # Tardis / Chatflow brain (production seam).
 TARDIS_MODEL = os.environ.get("TARDIS_MODEL", "chatflow")
 

@@ -38,7 +38,7 @@ class PredictiveAgent:
         self.llm = make_brain()
         self.memory = VectorMemory()
 
-    def predict(self, collector, interval_seconds: float) -> dict:
+    def predict(self, collector, interval_seconds: float, use_llm: bool = True) -> dict:
         grounded = grounding.ground(collector)
         latest = collector.history[-1] if collector.history else {}
 
@@ -71,7 +71,7 @@ class PredictiveAgent:
         # predicted. This is how a real predictive on-call system rations its
         # model budget, and it keeps the live demo fast.
         risk_elevated = grounded["risk_score"] >= config.RISK_AMBER
-        if self.llm.available and risk_elevated:
+        if use_llm and self.llm.available and risk_elevated:
             user = json.dumps(
                 {
                     "current_signals": latest,

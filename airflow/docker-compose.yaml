@@ -50,6 +50,13 @@ x-airflow-common: &airflow-common
     #     the transparent heuristic, or set BRAIN=tardis for the prod brain) ---
     BRAIN: ${BRAIN:-auto}
     GUARDIAN_TICK_SECONDS: "600"
+    # --- Copilot REST API brain (Claude Opus 4.8) for the detailed RCA + chat ---
+    # The host's GitHub Copilot subscription token is mounted read-only (see the
+    # volumes below) and COPILOT_TOKEN_STORE points the in-container brain at it,
+    # so the dashboard chat and the loop's RCA reason with Opus. No PAT/API key.
+    COPILOT_MODEL: ${COPILOT_MODEL:-claude-opus-4.8}
+    COPILOT_MAX_TOKENS: ${COPILOT_MAX_TOKENS:-8000}
+    COPILOT_TOKEN_STORE: ${COPILOT_TOKEN_STORE:-/opt/airflow/.copilot-standalone/token.json}
     # --- GitHub governance (real predicted-incident issue + gated PR) ---
     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
@@ -78,6 +85,10 @@ x-airflow-common: &airflow-common
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - ..:/opt/airflow/project
+    # Host GitHub Copilot subscription token (read-only) so the in-container brain
+    # can reach Claude Opus 4.8 via the Copilot API. Default is this host's token
+    # dir; override COPILOT_TOKEN_DIR in .env if your token.json lives elsewhere.
+    - ${COPILOT_TOKEN_DIR:-C:/Users/sandakag/.copilot-standalone}:/opt/airflow/.copilot-standalone:ro
   depends_on:
     postgres:
       condition: service_healthy
@@ -244,6 +255,30 @@ services:
       OTEL_SERVICE_NAME: predictive-guardian-dashboard
     ports:
       - "18089:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  # --- ALWAYS-ON REAL-TIME PREDICTION ENGINE ---------------------------------
+  # This is what makes the demo react live. It loops every few seconds:
+  #   extract live trades -> apply any audience-injected fault (ramping) ->
+  #   ETL -> collect signals (in memory, so trends build) -> predict the risk
+  #   BEFORE the failure line -> grade GREEN/AMBER/RED -> banner + audit + stream.
+  # An incident injected from the dashboard ramps from the instant you click it,
+  # so you watch latency/null-rate/volume drift, risk cross AMBER then RED with a
+  # real lead time, and a governed incident open — seconds before it would break.
+  # Runs in the CORE profile (no Kafka needed: falls back to a direct Coinbase
+  # fetch), so it is up whenever the dashboard is up.
+  guardian-loop:
+    <<: *airflow-common
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["python -m guardian_loop"]
+    working_dir: /opt/airflow/project
+    environment:
+      <<: *airflow-common-env
+      GUARDIAN_LOOP_INTERVAL: "6"
+      GUARDIAN_INJECT: "none"
     depends_on:
       postgres:
         condition: service_healthy
