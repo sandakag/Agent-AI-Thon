@@ -399,3 +399,66 @@ def open_preventive_pr(prediction: dict, decision: dict,
                       status=st, detail=str(pr)[:200])
     print(f"    -> [governance] PR API error ({st}): {str(pr)[:120]}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Demo cleanup — close every guardian-created artifact (surgical & idempotent)
+# ---------------------------------------------------------------------------
+def _list_all(path: str) -> list:
+    """GET every page of a GitHub list endpoint (best-effort)."""
+    out: list = []
+    for page in range(1, 21):  # hard cap: 20 pages (2000 items)
+        sep = "&" if "?" in path else "?"
+        st, items = _req("GET", f"{path}{sep}per_page=100&page={page}")
+        if st != 200 or not isinstance(items, list) or not items:
+            break
+        out.extend(items)
+        if len(items) < 100:
+            break
+    return out
+
+
+def cleanup_all() -> dict:
+    """Close every guardian-created issue + PR and delete the ``guardian/fix-*``
+    branches, returning counts. SURGICAL: only touches issues carrying the
+    ``predicted-incident`` label, PRs whose head branch starts with
+    ``guardian/fix-``, and those branches — never ``main`` or unrelated work."""
+    result = {"enabled": enabled(), "issues_closed": 0, "prs_closed": 0,
+              "branches_deleted": 0}
+    if not enabled():
+        print("    -> [cleanup] GitHub disabled (no GITHUB_TOKEN/REPOSITORY) — skipped")
+        return result
+    repo = config.GITHUB_REPOSITORY
+
+    # 1) Close open predicted-incident issues (the /issues feed also lists PRs —
+    #    skip those; PRs are handled below by head branch).
+    for it in _list_all(f"/repos/{repo}/issues?state=open&labels={_LABEL}"):
+        if it.get("pull_request") or it.get("number") is None:
+            continue
+        st, _ = _req("PATCH", f"/repos/{repo}/issues/{it['number']}",
+                     {"state": "closed", "state_reason": "not_planned"})
+        if st == 200:
+            result["issues_closed"] += 1
+
+    # 2) Close open guardian PRs (head branch guardian/fix-*).
+    for pr in _list_all(f"/repos/{repo}/pulls?state=open"):
+        head = ((pr.get("head") or {}).get("ref") or "")
+        if not head.startswith("guardian/fix-") or pr.get("number") is None:
+            continue
+        st, _ = _req("PATCH", f"/repos/{repo}/pulls/{pr['number']}", {"state": "closed"})
+        if st == 200:
+            result["prs_closed"] += 1
+
+    # 3) Delete the guardian/fix-* branches.
+    for ref in _list_all(f"/repos/{repo}/git/matching-refs/heads/guardian/fix-"):
+        name = ref.get("ref", "")  # e.g. refs/heads/guardian/fix-latency-...
+        if not name.startswith("refs/heads/guardian/fix-"):
+            continue
+        st, _ = _req("DELETE", f"/repos/{repo}/git/{name}")  # -> /git/refs/heads/...
+        if st in (200, 204):
+            result["branches_deleted"] += 1
+
+    audit_trail.audit("governance_cleanup", **result)
+    print(f"    -> [cleanup] GitHub: closed {result['issues_closed']} issue(s), "
+          f"{result['prs_closed']} PR(s), deleted {result['branches_deleted']} branch(es)")
+    return result

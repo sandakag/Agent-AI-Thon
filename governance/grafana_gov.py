@@ -238,3 +238,46 @@ def resolve_incidents() -> None:
     audit_trail.audit("grafana_incident_resolved", count=len(store),
                       signatures=list(store.keys()))
     _store_save({})
+
+
+def purge_annotations() -> int:
+    """Delete EVERY guardian-tagged Grafana annotation (the incident markers on
+    all boards) so the demo starts visually clean. Returns the count deleted.
+    Best-effort and non-fatal — never raises."""
+    base = (config.GRAFANA_URL or "").rstrip("/")
+    if not base:
+        return 0
+    deleted = 0
+    for _ in range(50):  # page through until no guardian annotations remain
+        req = urllib.request.Request(
+            f"{base}/api/annotations?tags=guardian&limit=100",
+            method="GET",
+            headers={"Authorization": _auth_header()},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                items = json.loads(resp.read().decode("utf-8") or "[]")
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+            break
+        if not isinstance(items, list) or not items:
+            break
+        any_deleted = False
+        for it in items:
+            aid = it.get("id")
+            if aid is None:
+                continue
+            dreq = urllib.request.Request(
+                f"{base}/api/annotations/{aid}", method="DELETE",
+                headers={"Authorization": _auth_header()},
+            )
+            try:
+                urllib.request.urlopen(dreq, timeout=6).close()
+                deleted += 1
+                any_deleted = True
+            except (urllib.error.URLError, TimeoutError, OSError):
+                pass
+        if not any_deleted:
+            break
+    audit_trail.audit("grafana_annotations_purged", count=deleted)
+    print(f"    -> [cleanup] Grafana: deleted {deleted} guardian annotation(s)")
+    return deleted
