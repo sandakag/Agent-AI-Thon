@@ -147,14 +147,15 @@ CHAT_LOG = config.DATA_DIR / "chat_log.json"
 PENDING_INCIDENT = config.DATA_DIR / "pending_incident.json"
 
 _CHAT_SYSTEM = (
-    "You are the assistant for a Predictive Pipeline Guardian — an expert AI SRE "
-    "that PREDICTS data-pipeline failures BEFORE they happen. Answer the operator's "
-    "question about the LIVE pipeline using ONLY the telemetry provided. Explain the "
-    "reasoning clearly: what is likely to break, WHEN (lead time), WHY (which signals "
-    "and the failure mechanism), the IMPACT (SLA / revenue / customers), and concrete "
-    "step-by-step remediation and PREVENTION. Prefer a thorough, well-structured "
-    "explanation when the question warrants it, but never pad or invent numbers. If "
-    "the telemetry does not support an answer, say so plainly."
+    "You are the Guardian — a friendly, expert AI SRE assistant for a Predictive "
+    "Pipeline Guardian that forecasts data-pipeline failures BEFORE they happen. "
+    "Answer conversationally and correctly. For questions about the LIVE pipeline, "
+    "ground your answer ONLY in the telemetry provided (risk, SLA, latency, data "
+    "quality, and the current/last root-cause analysis) and never invent numbers. "
+    "For general or conceptual questions — e.g. what a term or acronym means — just "
+    "answer normally (for example, RCA stands for Root Cause Analysis). Keep replies "
+    "concise (2-4 sentences) unless the operator asks you to go deep. If the telemetry "
+    "doesn't support an answer, say so plainly."
 )
 
 _brain = None
@@ -365,44 +366,40 @@ def _render_realtime(sla: dict, lat_series: list, risk_series: list,
     )
 
 
-def _load_rca() -> dict | None:
-    """The latest Opus-authored (or grounded) RCA the live engine produced."""
-    f = config.DATA_DIR / "latest_rca.json"
+def _load_rca_history() -> list:
+    """The stack of RCAs the live engine has produced (newest first)."""
+    f = config.DATA_DIR / "rca_history.json"
     if f.exists():
         try:
             d = json.loads(f.read_text(encoding="utf-8"))
-            if isinstance(d, dict) and d.get("root_cause"):
-                return d
+            if isinstance(d, list):
+                return [r for r in d if isinstance(r, dict) and r.get("root_cause")]
         except (json.JSONDecodeError, OSError):
             pass
-    return None
+    return []
 
 
-def _render_rca_html() -> str:
-    rca = _load_rca()
-    if not rca:
-        return ""
-
+def _rca_entry_html(rca: dict, open_: bool = False) -> str:
+    """One collapsible RCA card for the stack."""
     def lis(items) -> str:
         return "".join(f"<li>{_esc(i)}</li>" for i in (items or [])) \
             or '<li class="muted">(none)</li>'
-
     lvl = str(rca.get("level") or "AMBER").upper()
     col = _COLOR.get(lvl, "#d98c00")
-    src = str(rca.get("source") or "llm")
-    badge = ("Claude Opus 4.8" if "opus" in src.lower()
-             else "grounded heuristic" if "heuristic" in src.lower() else _esc(src))
+    src = str(rca.get("source") or "")
+    badge = ("Opus 4.8" if "opus" in src.lower()
+             else "grounded" if "heuristic" in src.lower() else _esc(src))
+    when = _esc((rca.get("generated_at") or "")[11:19])
     analysis = _esc(rca.get("detailed_analysis", "")).replace("\n", "<br>")
     return (
-        '<div class="sec">🔬 AI Root-Cause Analysis '
-        f'<span class="pill" style="background:{col}">{_esc(lvl)}</span> '
-        f'<span class="pill" style="background:#30363d">{badge}</span></div>'
-        '<div class="panel">'
-        f'<div style="font-size:15px;font-weight:700;margin-bottom:4px">{_esc(rca.get("title", ""))}</div>'
-        f'<div class="s" style="margin-bottom:8px">{_esc(rca.get("summary", ""))}</div>'
-        f'<div><b>Root cause:</b> {_esc(rca.get("root_cause", ""))}</div>'
-        f'<div style="margin-top:8px"><b>Detailed analysis</b>'
-        f'<div class="a" style="margin-top:4px">{analysis}</div></div>'
+        f'<details class="rcaitem"{" open" if open_ else ""}>'
+        f'<summary><span class="pill" style="background:{col}">{_esc(lvl)}</span> '
+        f'{_esc(rca.get("title", "Predicted incident"))} '
+        f'<span class="muted">· {when} UTC · {badge}</span></summary>'
+        '<div class="rcabody">'
+        f'<div class="s">{_esc(rca.get("summary", ""))}</div>'
+        f'<div style="margin-top:6px"><b>Root cause:</b> {_esc(rca.get("root_cause", ""))}</div>'
+        f'<div style="margin-top:6px"><b>Detailed analysis</b><div class="a">{analysis}</div></div>'
         '<div class="rcagrid">'
         f'<div><b>Timeline</b><ol>{lis(rca.get("timeline"))}</ol></div>'
         f'<div><b>Immediate actions (on-call)</b><ul>{lis(rca.get("immediate_actions"))}</ul></div>'
@@ -410,10 +407,38 @@ def _render_rca_html() -> str:
         f'<div><b>Impact</b><div class="a">{_esc(rca.get("impact", ""))}</div>'
         f'<b>Evidence</b><ul>{lis(rca.get("evidence"))}</ul></div>'
         '</div>'
-        f'<div class="muted" style="margin-top:6px">Generated {_esc((rca.get("generated_at") or "")[11:19])} UTC'
-        f' · confidence {_esc(rca.get("confidence", ""))}</div>'
-        '</div>'
+        f'<div class="muted" style="margin-top:6px">confidence {_esc(rca.get("confidence", ""))}</div>'
+        '</div></details>'
     )
+
+
+def _render_rca_html(banner_level: str) -> str:
+    """Render the RCA STACK. When an incident is ACTIVE (banner AMBER/RED) the
+    newest analysis is expanded and flagged ACTIVE; older ones collapse into a
+    stack. When GREEN, nothing shows as active — past analyses live in a collapsed
+    'recent incidents' stack, so a healthy board is never confused with a live one."""
+    history = _load_rca_history()
+    if not history:
+        return ""
+    active = str(banner_level).upper() in ("AMBER", "RED")
+    out = ['<div class="sec">🔬 AI Root-Cause Analysis</div>']
+    if active:
+        out.append('<div class="rcabadge red">● ACTIVE INCIDENT — analysis below</div>')
+        out.append(_rca_entry_html(history[0], open_=True))
+        rest = history[1:]
+        if rest:
+            out.append('<details class="rcastack"><summary>▸ Earlier incident analyses '
+                       f'({len(rest)})</summary>')
+            out.extend(_rca_entry_html(r) for r in rest)
+            out.append('</details>')
+    else:
+        out.append('<div class="panel rcaok">✓ No active incident — the pipeline is healthy. '
+                   'Past analyses are stacked below for reference.</div>')
+        out.append('<details class="rcastack"><summary>▸ Recent incident analyses '
+                   f'({len(history)})</summary>')
+        out.extend(_rca_entry_html(r) for r in history)
+        out.append('</details>')
+    return "".join(out)
 
 
 def _chat_context() -> dict:
@@ -435,7 +460,7 @@ def _chat_context() -> dict:
         },
         "latest_signals": signals,
         "sla": _sla_view(hist),
-        "root_cause_analysis": _load_rca(),
+        "root_cause_analysis": (_load_rca_history()[:1] or [None])[0],
         "recent_failure_types": [p.get("predicted_failure_type")
                                  for p in s.get("recent_predictions", [])][:8],
         "totals": s.get("totals"),
@@ -655,23 +680,27 @@ def _grounded_answer(q: str, ctx: dict) -> str:
 def _answer_question(q: str) -> str:
     q = (q or "").strip()[:500]
     if not q:
-        return "Ask about the pipeline's risk, what's likely to fail, when, or how to prevent it."
+        return "Ask me about the pipeline's risk, the SLA, data quality, or an incident's root cause."
     ctx = _chat_context()
-    # Fast by default: the grounded assistant answers instantly from live telemetry
-    # (and serves the pre-generated Opus RCA for "why/explain"). A live Opus call
-    # per message is opt-in (CHAT_USE_LLM) because it adds ~20-40s of latency.
-    if config.CHAT_USE_LLM:
+    ql = " ".join(q.lower().split())
+    is_greeting = ql in ("hi", "hello", "hey", "yo", "hola", "thanks", "thank you",
+                         "ty", "thx", "sup", "gm") or any(
+        ql == g or ql.startswith(g + " ") for g in _GREETINGS)
+    # Greetings stay instant; every real question is reasoned by Opus 4.8 so it can
+    # answer anything — live telemetry OR general (e.g. "what does RCA stand for?").
+    if not is_greeting and config.CHAT_USE_LLM:
         brain = _get_brain()
         if brain is not None and getattr(brain, "available", False):
             user = (f"Operator question: {q}\n\nLive telemetry (JSON):\n"
                     f"{json.dumps(ctx, default=str)}")
             try:
                 reply = brain.chat(_CHAT_SYSTEM, user).strip()
-                return reply or _grounded_answer(q, ctx)
+                if reply:
+                    return reply
             except BrainError:
-                return _grounded_answer(q, ctx)
+                pass
             except Exception:  # noqa: BLE001 - a chat hiccup must never crash the dashboard
-                return _grounded_answer(q, ctx)
+                pass
     return _grounded_answer(q, ctx)
 
 
@@ -688,11 +717,10 @@ def _write_pending_incident(payload: dict) -> dict:
                                              encoding="utf-8")
         except OSError:
             pass
-        for p in (config.GUARDIAN_STATE_FILE, config.DATA_DIR / "latest_rca.json"):
-            try:
-                p.unlink()
-            except OSError:
-                pass
+        try:
+            config.GUARDIAN_STATE_FILE.unlink()
+        except OSError:
+            pass
         try:
             PENDING_INCIDENT.write_text(json.dumps({"reset": True, "label": "clear"}),
                                         encoding="utf-8")
@@ -862,7 +890,7 @@ def render_html() -> str:
     risk_series = [p.get("risk_score") for p in reversed(s["recent_predictions"])
                    if isinstance(p.get("risk_score"), (int, float))]
     realtime_html = _render_realtime(sla, lat_series, risk_series, rec_series, hist)
-    rca_html = _render_rca_html()
+    rca_html = _render_rca_html(level)
 
     def card(label: str, value: object, sub: str = "") -> str:
         return (f'<div class="card"><div class="v">{_esc(value)}</div>'
@@ -949,6 +977,16 @@ def render_html() -> str:
  .rcagrid{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:10px}}
  .rcagrid ul,.rcagrid ol{{margin:4px 0 0 18px;padding:0}} .rcagrid li{{font-size:12px;margin:2px 0;color:#c9d3de}}
  .rcagrid>div>b{{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.04em}}
+ .rcabadge{{display:inline-block;font-size:11px;font-weight:700;color:#fff;padding:3px 9px;border-radius:8px;margin-bottom:8px}}
+ .rcabadge.red{{background:#c0392b}}
+ .rcaok{{color:#3fb950;font-size:13px;font-weight:600}}
+ .rcaitem{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px 12px;margin-bottom:8px}}
+ .rcaitem>summary{{cursor:pointer;font-size:13px;font-weight:600;list-style:none}}
+ .rcaitem>summary::-webkit-details-marker{{display:none}}
+ .rcaitem[open]>summary{{margin-bottom:8px;border-bottom:1px solid #21262d;padding-bottom:8px}}
+ .rcabody{{font-size:13px;color:#c9d3de}} .rcabody .s{{color:#8b949e}} .rcabody .a{{color:#9fb6cf;margin-top:3px;white-space:pre-wrap}}
+ .rcabody b{{color:#e6edf3}}
+ .rcastack{{margin-bottom:12px}} .rcastack>summary{{cursor:pointer;color:#8b949e;font-size:12px;padding:8px 0;user-select:none}}
  .card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px}}
  .card .v{{font-size:22px;font-weight:700}} .card .l{{color:#8b949e;font-size:11px;margin-top:2px}} .card .s{{color:#6e7681;font-size:10px}}
  table{{width:100%;border-collapse:collapse;background:#161b22;border-radius:10px;overflow:hidden}}

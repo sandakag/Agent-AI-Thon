@@ -140,12 +140,12 @@ COPILOT_API_TIMEOUT = int(os.environ.get("COPILOT_API_TIMEOUT", "120"))
 # Used to hand the host's subscription token to the headless Docker containers.
 COPILOT_TOKEN_STORE = os.environ.get("COPILOT_TOKEN_STORE", "")
 
-# Chat box speed: by default the chat answers INSTANTLY from the grounded
-# assistant (and serves the pre-generated Opus RCA for "why/explain"). Set
-# CHAT_USE_LLM=true to make every chat message call Opus live instead — richer,
-# but ~20-40s per reply. The detailed Opus analysis is always available via the
-# RCA the engine pre-generates on each incident, so the chat stays fast.
-CHAT_USE_LLM = os.environ.get("CHAT_USE_LLM", "false").lower() in ("1", "true", "yes")
+# Chat box: by default the chat now uses the real Claude Opus 4.8 brain so it can
+# answer ANY question (e.g. "what does RCA stand for?") like a proper assistant.
+# Greetings and quick status pings stay instant on the grounded path; everything
+# else is reasoned by Opus. Set CHAT_USE_LLM=false to force the fast grounded-only
+# assistant (no live model call). The detailed RCA is always Opus-authored.
+CHAT_USE_LLM = os.environ.get("CHAT_USE_LLM", "true").lower() in ("1", "true", "yes")
 
 
 # Tardis / Chatflow brain (production seam).

@@ -33,10 +33,17 @@ _MONITOR_LABEL = {
     "source_errors": "source errors",
 }
 
-# The continuous signals modelled by the forecaster (all treated identically).
+# The continuous signals the forecaster models for FAILURE detection. Only
+# signals that are stable on healthy live data and are actually driven by a
+# pipeline fault belong here: null-rate (data quality), latency (processing SLA),
+# record volume (throughput/starvation) and duplicate rate (at-least-once storms).
+# Revenue / throughput-rate / freshness-lag / product-coverage are DERIVED or
+# naturally noisy on a live market feed, so treating them as failure signals
+# produced false-positive incidents (e.g. a "revenue anomaly" from a normal market
+# dip while every pipeline metric was healthy). They stay as DISPLAYED metrics but
+# no longer trigger an incident on their own.
 _NUMERIC_SIGNALS = (
-    "null_rate", "latency_ms", "record_count", "revenue",
-    "throughput_rps", "distinct_products", "lag_seconds", "dup_rate",
+    "null_rate", "latency_ms", "record_count", "dup_rate",
 )
 
 # Real failure lines. Used ONLY to convert a drift into a time-to-breach — they

@@ -57,7 +57,7 @@ START_INJECT = str(os.environ.get("GUARDIAN_INJECT", "none") or "none")
 START_INJECT_AT = int(os.environ.get("GUARDIAN_INJECT_AT", "6"))
 
 _PENDING = config.DATA_DIR / "pending_incident.json"
-_RCA_FILE = config.DATA_DIR / "latest_rca.json"
+_RCA_HISTORY = config.DATA_DIR / "rca_history.json"
 
 # The real-time risk loop runs on the fast grounded heuristic; the expensive
 # Opus RCA is generated ONCE per incident in a background thread (deduped by the
@@ -71,11 +71,28 @@ def _signature(prediction: dict) -> str:
     return "".join(c if c.isalnum() else "-" for c in ft).strip("-") or "unknown"
 
 
-def _clear_rca() -> None:
+def _reset_rca_dedupe() -> None:
+    """Forget the last incident signature so a re-injected incident regenerates a
+    fresh RCA. The RCA history STACK is kept (past analyses stay for reference);
+    only a full stack wipe removes it."""
     with _rca_lock:
         _rca_state["sig"] = None
+
+
+def _append_rca(rca: dict) -> None:
+    """Prepend a new RCA onto the bounded history stack (newest first)."""
+    hist: list = []
+    if _RCA_HISTORY.exists():
+        try:
+            loaded = json.loads(_RCA_HISTORY.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                hist = loaded
+        except (OSError, json.JSONDecodeError):
+            hist = []
+    hist.insert(0, rca)
     try:
-        _RCA_FILE.unlink()
+        _RCA_HISTORY.write_text(json.dumps(hist[:12], indent=2, default=str),
+                                encoding="utf-8")
     except OSError:
         pass
 
@@ -96,7 +113,7 @@ def _maybe_generate_rca(prediction: dict, signals_window: list, brain, tick: int
             r["generated_tick"] = tick
             r["generated_at"] = datetime.now(timezone.utc).isoformat()
             r["level"] = "RED" if (prediction.get("risk_score") or 0) >= config.RISK_RED else "AMBER"
-            _RCA_FILE.write_text(json.dumps(r, indent=2, default=str), encoding="utf-8")
+            _append_rca(r)
             with _rca_lock:
                 _rca_state["sig"] = sig
             audit_trail.audit("rca_generated", signature=sig,
@@ -168,7 +185,7 @@ def main() -> None:
                     # Clear. A brief re-warmup then relearns the live normal.
                     collector.history.clear()
                     clear_incident()
-                    _clear_rca()
+                    _reset_rca_dedupe()
                     audit_trail.stream_emit("guardian_incident_reset", tick=tick)
                     print(f"    >>> RESET at tick {tick} — fault cleared, "
                           "pipeline returns to healthy live data.", flush=True)
