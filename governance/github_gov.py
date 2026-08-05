@@ -97,29 +97,40 @@ def find_open_issue(sig: str) -> tuple[str | None, int | None]:
     return None, None
 
 
-def _issue_body(prediction: dict, decision: dict, sig: str) -> str:
-    ev = "\n".join(f"- {e}" for e in prediction.get("evidence", [])[:8]) or "- (none)"
-    return (
+def _issue_body(prediction: dict, decision: dict, sig: str, rca: dict | None = None) -> str:
+    header = (
         f"{_marker(sig)}\n"
         f"## 🔮 Predicted pipeline incident — raised BEFORE failure\n\n"
-        f"The predictive guardian forecasts a **{prediction.get('predicted_failure_type')}** "
-        f"failure. This ticket was opened while the pipeline is still healthy, to buy "
-        f"lead time.\n\n"
         f"| Signal | Value |\n|---|---|\n"
         f"| Severity | **{decision.get('level')}** |\n"
         f"| Risk score | **{prediction.get('risk_score')}/100** |\n"
-        f"| Pipeline health | {prediction.get('pipeline_health')}/100 |\n"
-        f"| Confidence | {prediction.get('confidence')} |\n"
         f"| Predicted lead time | ~{prediction.get('lead_time_minutes')} min |\n"
+        f"| Confidence | {prediction.get('confidence')} |\n"
         f"| Reasoned by | `{prediction.get('source')}` |\n\n"
-        f"### Grounded evidence\n{ev}\n\n"
-        f"### Recommended preventive action\n{prediction.get('recommended_action')}\n\n"
-        f"> 🛡️ Governance: the AI predicted and prepared the fix, then stopped. "
-        f"A human approves the merge of the gated PR.\n"
+    )
+    footer = (
+        "\n> 🛡️ Governance: the AI predicted this and WROTE the analysis above, then "
+        "STOPPED. A human approved filing this ticket; a human approves any fix or merge.\n"
+    )
+    # Prefer the AI-written (Opus) root-cause analysis — the SAME analysis shown on
+    # the dashboard — so the issue is genuinely authored, not a static template.
+    if rca and rca.get("root_cause"):
+        try:
+            from agent import rca as rca_mod
+            return header + rca_mod.render_markdown(rca) + footer
+        except Exception:  # noqa: BLE001
+            pass
+    ev = "\n".join(f"- {e}" for e in prediction.get("evidence", [])[:8]) or "- (none)"
+    return (
+        header
+        + f"### Grounded evidence\n{ev}\n\n"
+        + f"### Recommended preventive action\n{prediction.get('recommended_action')}\n"
+        + footer
     )
 
 
-def open_predicted_incident_issue(prediction: dict, decision: dict) -> str | None:
+def open_predicted_incident_issue(prediction: dict, decision: dict,
+                                  rca: dict | None = None) -> str | None:
     """Open (or reuse) the predicted-incident issue. De-dupes per signature."""
     sig = signature(prediction)
     if not enabled():
@@ -129,10 +140,19 @@ def open_predicted_incident_issue(prediction: dict, decision: dict) -> str | Non
               "(set GITHUB_TOKEN + GITHUB_REPOSITORY to enable)")
         return None
 
-    existing_url, _ = find_open_issue(sig)
+    existing_url, existing_num = find_open_issue(sig)
     if existing_url:
-        audit_trail.audit("governance_issue_deduped", signature=sig, url=existing_url)
-        print(f"    -> [governance] predicted-incident issue already open: {existing_url}")
+        # Keep a REUSED ticket fresh: overwrite its body with the latest AI-written
+        # RCA so it is never a stale, repeated template (the de-dupe used to return
+        # the old body verbatim, which is why every issue looked identical).
+        if rca and rca.get("root_cause") and existing_num:
+            _req("PATCH", f"/repos/{config.GITHUB_REPOSITORY}/issues/{existing_num}",
+                 {"body": _issue_body(prediction, decision, sig, rca)})
+            audit_trail.audit("governance_issue_refreshed", signature=sig, url=existing_url)
+            print(f"    -> [governance] predicted-incident issue refreshed (AI-written): {existing_url}")
+        else:
+            audit_trail.audit("governance_issue_deduped", signature=sig, url=existing_url)
+            print(f"    -> [governance] predicted-incident issue already open: {existing_url}")
         return existing_url
 
     _ensure_label()
@@ -142,7 +162,7 @@ def open_predicted_incident_issue(prediction: dict, decision: dict) -> str | Non
              f"(risk {prediction.get('risk_score')}/100)")
     status, data = _req(
         "POST", f"/repos/{repo}/issues",
-        {"title": title, "body": _issue_body(prediction, decision, sig),
+        {"title": title, "body": _issue_body(prediction, decision, sig, rca),
          "labels": [_LABEL]},
     )
     if status in (200, 201) and isinstance(data, dict):
@@ -179,24 +199,31 @@ def find_open_pr(branch: str) -> str | None:
     return None
 
 
-def _runbook(prediction: dict, decision: dict, sig: str) -> str:
-    ev = "\n".join(f"- {e}" for e in prediction.get("evidence", [])[:8]) or "- (none)"
+def _runbook(prediction: dict, decision: dict, sig: str, rca: dict | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
-    return (
+    head = (
         f"# Preventive remediation — {prediction.get('predicted_failure_type')}\n\n"
         f"_Staged by the Predictive Pipeline Guardian at {now}. Gated — a human "
         f"approves the merge._\n\n"
-        f"- **Severity:** {decision.get('level')}\n"
-        f"- **Risk score:** {prediction.get('risk_score')}/100\n"
-        f"- **Predicted lead time:** ~{prediction.get('lead_time_minutes')} min\n"
-        f"- **Confidence:** {prediction.get('confidence')}\n"
-        f"- **Reasoned by:** `{prediction.get('source')}`\n\n"
-        f"## Evidence\n{ev}\n\n"
-        f"## Recommended action\n{prediction.get('recommended_action')}\n"
+    )
+    if rca and rca.get("root_cause"):
+        try:
+            from agent import rca as rca_mod
+            return head + rca_mod.render_markdown(rca)
+        except Exception:  # noqa: BLE001
+            pass
+    ev = "\n".join(f"- {e}" for e in prediction.get("evidence", [])[:8]) or "- (none)"
+    return (
+        head
+        + f"- **Severity:** {decision.get('level')}\n"
+        + f"- **Risk score:** {prediction.get('risk_score')}/100\n"
+        + f"- **Predicted lead time:** ~{prediction.get('lead_time_minutes')} min\n\n"
+        + f"## Evidence\n{ev}\n\n## Recommended action\n{prediction.get('recommended_action')}\n"
     )
 
 
-def open_preventive_pr(prediction: dict, decision: dict) -> str | None:
+def open_preventive_pr(prediction: dict, decision: dict,
+                       rca: dict | None = None) -> str | None:
     """Open a gated preventive PR that commits a remediation runbook. De-dupes
     per signature; NEVER auto-merged."""
     sig = signature(prediction)
@@ -236,7 +263,7 @@ def open_preventive_pr(prediction: dict, decision: dict) -> str | None:
 
     path = f"prevention/{sig}.md"
     content_b64 = base64.b64encode(
-        _runbook(prediction, decision, sig).encode("utf-8")
+        _runbook(prediction, decision, sig, rca).encode("utf-8")
     ).decode("ascii")
     # if the file already exists on the branch we need its blob sha to update
     sha = None

@@ -179,11 +179,17 @@ def main() -> None:
             if pend is not None:
                 if pend.get("reset"):
                     active_mode, active_spec = "none", None
-                    # Drop the incident's signal tail so the very next tick reads
-                    # healthy — otherwise the lingering high-latency history keeps
-                    # the risk elevated and the banner flickers back to AMBER after
-                    # Clear. A brief re-warmup then relearns the live normal.
+                    # Drop only the incident SPIKES from the window (not the whole
+                    # history), so the banner settles GREEN immediately AND the
+                    # healthy baseline is preserved for FAST re-detection of the
+                    # next incident (clearing everything forced a slow re-warmup).
+                    healthy = [h for h in collector.history if (
+                        (h.get("latency_ms") or 0) < config.SLA_LATENCY_MS
+                        and (h.get("null_rate") or 0) < 0.1
+                        and (h.get("dup_rate") or 0) < 0.1)]
                     collector.history.clear()
+                    for h in healthy[-30:]:
+                        collector.history.append(h)
                     clear_incident()
                     _reset_rca_dedupe()
                     audit_trail.stream_emit("guardian_incident_reset", tick=tick)

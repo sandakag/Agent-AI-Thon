@@ -24,6 +24,27 @@ _ICON = {"GREEN": "[GREEN]", "AMBER": "[AMBER]", "RED": "[RED]"}
 # incident (many AMBER/RED ticks) governs ONCE, not every tick.
 _last_gov_sig = None
 
+REQUIRE_APPROVAL = config.GOVERNANCE_REQUIRE_APPROVAL
+
+
+def _read_banner() -> dict:
+    try:
+        d = json.loads(config.INCIDENTS_FILE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _latest_rca() -> dict | None:
+    """Newest Opus-authored RCA from the stack (attached to the governed issue)."""
+    try:
+        d = json.loads((config.DATA_DIR / "rca_history.json").read_text(encoding="utf-8"))
+        if isinstance(d, list) and d and isinstance(d[0], dict) and d[0].get("root_cause"):
+            return d[0]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
 
 def emit(tick: int, prediction: dict, decision: dict) -> None:
     level = decision["level"]
@@ -53,21 +74,26 @@ def emit(tick: int, prediction: dict, decision: dict) -> None:
         source=prediction.get("source"),
     )
 
-    issue_url = pr_url = None
     if decision["should_alert"]:
         # Write the banner IMMEDIATELY so the dashboard flips AMBER/RED with ZERO
-        # lag. The GitHub + Grafana governance can hit the network and be slow, so
-        # it runs OFF the hot path in a background thread (deduped per signature)
-        # and patches the banner with the issue / PR links once they exist. This
-        # is what keeps the live loop real-time and the banner instant.
+        # lag. Preserve any approval already given for THIS incident across ticks
+        # (emit runs every alert tick, so it must not reset the operator's approval).
+        prev = _read_banner()
+        same = (prev.get("level") in ("AMBER", "RED") and
+                (prev.get("prediction") or {}).get("predicted_failure_type")
+                == prediction.get("predicted_failure_type"))
+        approved = bool(same and prev.get("approved"))
         config.INCIDENTS_FILE.write_text(
             json.dumps(
                 {
                     "level": level,
                     "prediction": prediction,
-                    "issue_url": None,
-                    "pr_url": None,
-                    "opened": datetime.now(timezone.utc).isoformat(),
+                    "require_approval": REQUIRE_APPROVAL,
+                    "awaiting_approval": (REQUIRE_APPROVAL and not approved),
+                    "approved": approved,
+                    "issue_url": prev.get("issue_url") if same else None,
+                    "pr_url": prev.get("pr_url") if same else None,
+                    "opened": prev.get("opened") if same else datetime.now(timezone.utc).isoformat(),
                 },
                 indent=2,
                 default=str,
@@ -77,32 +103,21 @@ def emit(tick: int, prediction: dict, decision: dict) -> None:
         sig = github_gov.signature(prediction)
         if sig != _last_gov_sig:
             _last_gov_sig = sig
-            threading.Thread(target=_govern_async,
+            # The Grafana observability MARKER is monitoring (not a governed change),
+            # so it is always dropped. The GitHub issue / preventive PR / IRM incident
+            # are GOVERNED actions: auto-filed only when approval is NOT required;
+            # otherwise they wait for the operator to click Approve on the dashboard.
+            threading.Thread(target=_annotate_async,
                              args=(prediction, decision, level), daemon=True).start()
+            if not REQUIRE_APPROVAL:
+                threading.Thread(target=_govern_async,
+                                 args=(prediction, decision, level, _latest_rca()),
+                                 daemon=True).start()
 
 
-def _govern_async(prediction: dict, decision: dict, level: str) -> None:
-    """Open the governed issue / gated PR + Grafana incident off the hot path,
-    then patch the banner with the resulting links. Runs once per incident."""
-    issue_url = pr_url = None
-    try:
-        if decision["should_open_issue"]:
-            issue_url = github_gov.open_predicted_incident_issue(prediction, decision)
-        if decision["should_open_pr"]:
-            pr_url = github_gov.open_preventive_pr(prediction, decision)
-    except Exception:  # noqa: BLE001 - governance must never break anything
-        pass
-
-    # Patch the banner with the links, but only if this incident is still showing.
-    try:
-        cur = json.loads(config.INCIDENTS_FILE.read_text())
-        if isinstance(cur, dict) and cur.get("level") == level:
-            cur["issue_url"] = issue_url
-            cur["pr_url"] = pr_url
-            config.INCIDENTS_FILE.write_text(json.dumps(cur, indent=2, default=str))
-    except (OSError, json.JSONDecodeError):
-        pass
-
+def _annotate_async(prediction: dict, decision: dict, level: str) -> None:
+    """Drop the Grafana observability marker + live-stream log (monitoring only —
+    this is NOT a governed change, so it never needs approval)."""
     try:
         annotation_id = grafana_gov.annotate(prediction, decision)
     except Exception:  # noqa: BLE001 - observability must never break the loop
@@ -115,6 +130,31 @@ def _govern_async(prediction: dict, decision: dict, level: str) -> None:
         lead_time_minutes=prediction.get("lead_time_minutes"),
         annotation=annotation_id or "n/a",
     )
+
+
+def _govern_async(prediction: dict, decision: dict, level: str,
+                  rca: dict | None = None) -> tuple:
+    """File the GOVERNED artifacts: the AI-written GitHub issue / gated PR and the
+    Grafana IRM incident, then patch the banner with the links. Returns
+    ``(issue_url, pr_url)``. Never auto-merges. Runs once per incident / on approval."""
+    issue_url = pr_url = None
+    try:
+        if decision.get("should_open_issue"):
+            issue_url = github_gov.open_predicted_incident_issue(prediction, decision, rca=rca)
+        if decision.get("should_open_pr"):
+            pr_url = github_gov.open_preventive_pr(prediction, decision, rca=rca)
+    except Exception:  # noqa: BLE001 - governance must never break anything
+        pass
+
+    # Patch the banner with the links, but only if this incident is still showing.
+    try:
+        cur = _read_banner()
+        if cur.get("level") == level:
+            cur["issue_url"] = issue_url
+            cur["pr_url"] = pr_url
+            config.INCIDENTS_FILE.write_text(json.dumps(cur, indent=2, default=str))
+    except (OSError, json.JSONDecodeError):
+        pass
 
     try:
         incident_ref = grafana_gov.open_incident(
@@ -130,6 +170,43 @@ def _govern_async(prediction: dict, decision: dict, level: str) -> None:
         risk_score=prediction.get("risk_score"),
         incident=incident_ref or "n/a",
     )
+    return issue_url, pr_url
+
+
+def approve_active_incident() -> dict:
+    """Operator approval from the dashboard: file the governed GitHub issue / gated
+    PR (AI-written) + Grafana IRM incident for the ACTIVE incident. Nothing is filed
+    before this click, and nothing is ever auto-merged."""
+    banner = _read_banner()
+    level = banner.get("level")
+    if level not in ("AMBER", "RED"):
+        return {"status": "no_active_incident"}
+    if banner.get("approved"):
+        return {"status": "already_approved",
+                "issue_url": banner.get("issue_url"), "pr_url": banner.get("pr_url")}
+    prediction = banner.get("prediction") or {}
+    decision = {
+        "level": level,
+        "should_alert": True,
+        "should_open_issue": True,
+        "should_open_pr": level == "RED",
+        "recommendation": prediction.get("recommended_action", ""),
+    }
+    issue_url, pr_url = _govern_async(prediction, decision, level, _latest_rca())
+    banner = _read_banner()
+    banner["approved"] = True
+    banner["awaiting_approval"] = False
+    banner["issue_url"] = issue_url
+    banner["pr_url"] = pr_url
+    banner["approved_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        config.INCIDENTS_FILE.write_text(json.dumps(banner, indent=2, default=str))
+    except OSError:
+        pass
+    audit_trail.audit("governance_approved", level=level,
+                      predicted_failure_type=prediction.get("predicted_failure_type"),
+                      issue_url=issue_url, pr_url=pr_url)
+    return {"status": "approved", "issue_url": issue_url, "pr_url": pr_url}
 
 
 def clear_incident() -> None:

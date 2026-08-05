@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import config
 from agent import audit_trail
 from agent.brain import make_brain, BrainError
+from alerting import notifier
 
 
 def build_summary() -> dict:
@@ -807,14 +808,14 @@ _COLOR = {"GREEN": "#1f9d55", "AMBER": "#d98c00", "RED": "#c0392b"}
 
 
 _INJECT_BUTTONS = (
-    '<button class="alt" onclick=\'induce({label:"null the size field",ops:[{op:"null_field",field:"size"}]})\'>Null size</button>'
-    '<button class="alt" onclick=\'induce({label:"rename price to px",ops:[{op:"rename_field",field:"price",to:"px"}]})\'>Rename price</button>'
-    '<button class="alt" onclick=\'induce({label:"price outlier spike",ops:[{op:"scale_field",field:"price",factor:50}]})\'>Price x50</button>'
-    '<button class="alt" onclick=\'induce({label:"freeze price (stale feed)",ops:[{op:"freeze_field",field:"price"}]})\'>Freeze price</button>'
-    '<button class="alt" onclick=\'induce({label:"volume collapse",ops:[{op:"shrink_batch"}]})\'>Shrink batch</button>'
-    '<button class="alt" onclick=\'induce({label:"duplicate storm",ops:[{op:"duplicate"}]})\'>Dup storm</button>'
-    '<button class="alt" onclick=\'induce({label:"load latency",ops:[{op:"latency",ms:800}]})\'>Add latency</button>'
-    '<button class="alt" onclick=\'induce({reset:true})\'>Clear</button>'
+    '<button class="alt" onclick=\'fillIncident("null the size field",[{op:"null_field",field:"size"}])\'>Null size</button>'
+    '<button class="alt" onclick=\'fillIncident("rename price to px",[{op:"rename_field",field:"price",to:"px"}])\'>Rename price</button>'
+    '<button class="alt" onclick=\'fillIncident("price outlier spike",[{op:"scale_field",field:"price",factor:50}])\'>Price x50</button>'
+    '<button class="alt" onclick=\'fillIncident("freeze price (stale feed)",[{op:"freeze_field",field:"price"}])\'>Freeze price</button>'
+    '<button class="alt" onclick=\'fillIncident("volume collapse",[{op:"shrink_batch"}])\'>Shrink batch</button>'
+    '<button class="alt" onclick=\'fillIncident("duplicate storm",[{op:"duplicate"}])\'>Dup storm</button>'
+    '<button class="alt" onclick=\'fillIncident("load latency",[{op:"latency",ms:800}])\'>Add latency</button>'
+    '<button onclick=\'induce({reset:true})\'>Clear / Resolve</button>'
 )
 
 _SCRIPT = """
@@ -848,9 +849,18 @@ async function induce(spec){
 function induceCustom(){
   var label=(document.getElementById('inclabel').value||'custom incident');
   var raw=(document.getElementById('incops').value||'').trim();
-  if(!raw){alert('paste an ops JSON array, or use the quick buttons');return;}
+  if(!raw){alert('click a preset to load it, or paste an ops JSON array');return;}
   var ops; try{ops=JSON.parse(raw);}catch(e){alert('ops must be a valid JSON array');return;}
   induce({label:label,ops:ops});
+}
+function fillIncident(label, ops){
+  var l=document.getElementById('inclabel'); if(l)l.value=label;
+  var t=document.getElementById('incops'); if(t){t.value=JSON.stringify(ops);t.focus();}
+}
+async function approveGov(){
+  var b=document.getElementById('apprbtn'); if(b){b.disabled=true;b.textContent='Filing…';}
+  try{await fetch('/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}
+  location.reload();
 }
 // Restore the chat open/closed state so it survives the live auto-refresh.
 (function(){try{if(localStorage.getItem('guardianChatOpen')==='1'){var cw=document.getElementById('cw');if(cw){cw.classList.add('open');var m=document.getElementById('cwmsgs');if(m)m.scrollTop=m.scrollHeight;}}}catch(e){}})();
@@ -899,14 +909,28 @@ def render_html() -> str:
 
     banner_body = ""
     if level != "GREEN":
+        awaiting = banner.get("awaiting_approval")
+        approved = banner.get("approved")
         links = ""
         if banner.get("issue_url"):
             links += f' &nbsp;·&nbsp; <a href="{_esc(banner["issue_url"])}" target="_blank">predicted-incident issue</a>'
         if banner.get("pr_url"):
-            links += f' &nbsp;·&nbsp; <a href="{_esc(banner["pr_url"])}" target="_blank">gated preventive PR (awaiting approval)</a>'
+            links += f' &nbsp;·&nbsp; <a href="{_esc(banner["pr_url"])}" target="_blank">gated preventive PR (awaiting human merge)</a>'
+        if awaiting:
+            action = ('<div class="appr">⏸ <b>Awaiting your approval.</b> The AI predicted this and wrote '
+                      'the root-cause analysis + recommended fix (below), but has filed <b>nothing</b> yet. '
+                      'Review it, then approve to open the AI-written governed issue + gated preventive PR '
+                      '— nothing is ever merged or auto-fixed without you.'
+                      '<div class="row"><button id="apprbtn" onclick="approveGov()">✓ Approve &amp; file governed issue / PR</button>'
+                      '<button class="alt" onclick="induce({reset:true})">Dismiss (I\'ll fix it manually)</button></div></div>')
+        elif approved:
+            action = f'<div class="appr ok">✓ Approved by you — AI-written governed issue / PR filed.{links}</div>'
+        else:
+            action = (f'<div class="bnr-sub">{links}</div>' if links else '')
         banner_body = (
             f'<div class="bnr-sub">Predicted <b>{_esc(pred.get("predicted_failure_type", "failure"))}</b>'
-            f' — risk {_esc(pred.get("risk_score"))}/100, ~{_esc(pred.get("lead_time_minutes"))} min lead time.{links}</div>'
+            f' — risk {_esc(pred.get("risk_score"))}/100, ~{_esc(pred.get("lead_time_minutes"))} min lead time.</div>'
+            + action
         )
     else:
         banner_body = '<div class="bnr-sub">Live pipeline healthy — watching for early risk.</div>'
@@ -949,15 +973,18 @@ def render_html() -> str:
         '&ldquo;explain the root cause&rdquo;.</div>')
     panels_html = (
         '<div class="sec">🧪 Induce your OWN incident (unknown to the AI)</div>'
-        '<div class="panel"><div class="row">' + _INJECT_BUTTONS + '</div>'
-        "<textarea id=\"incops\" placeholder='advanced: ops JSON array, e.g. "
+        '<div class="panel">'
+        '<div class="muted" style="margin-bottom:6px">Step 1 — click a preset to LOAD it into the box '
+        '(it does <b>not</b> fire yet), or write your own ops. Step 2 — click <b>Induce custom incident</b> '
+        'to actually inject it. <b>Clear / Resolve</b> ends the active incident.</div>'
+        '<div class="row">' + _INJECT_BUTTONS + '</div>'
+        "<textarea id=\"incops\" placeholder='ops JSON array, e.g. "
         "[{&quot;op&quot;:&quot;null_field&quot;,&quot;field&quot;:&quot;size&quot;},"
-        "{&quot;op&quot;:&quot;latency&quot;,&quot;ms&quot;:1200}]'></textarea>"
+        "{&quot;op&quot;:&quot;latency&quot;,&quot;ms&quot;:800}]'></textarea>"
         '<div class="row"><input id="inclabel" placeholder="incident name (optional)">'
         '<button onclick="induceCustom()">Induce custom incident</button></div>'
-        '<div class="muted" style="margin-top:6px">Lands on the next tick of the always-on '
-        'guardian engine (a few seconds) and ramps from there. The agent is never told what '
-        'you did — watch it predict the failure BEFORE it breaks, then press <b>Clear</b> to recover.</div></div>'
+        '<div class="muted" style="margin-top:6px">Once induced it lands on the next tick (a few seconds) and '
+        'ramps. The agent is never told what you did — watch it predict the failure BEFORE it breaks.</div></div>'
     )
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -969,6 +996,8 @@ def render_html() -> str:
  .bnr{{background:{color};border-radius:12px;padding:16px 20px;margin-bottom:18px}}
  .bnr b{{font-weight:700}} .bnr-title{{font-size:18px;font-weight:700}} .bnr-sub{{margin-top:6px;font-size:13px;opacity:.95}}
  .bnr a{{color:#fff;text-decoration:underline}}
+ .appr{{background:rgba(0,0,0,.22);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:13px;line-height:1.5}}
+ .appr.ok{{background:rgba(0,0,0,.28)}} .appr .row{{margin-top:8px}} .appr a{{color:#fff}}
  .grid{{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:18px}}
  .grid3{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}}
  .panel.sp .v{{font-size:24px;font-weight:700}} .panel.sp .l{{color:#8b949e;font-size:11px}}
@@ -1112,6 +1141,14 @@ class Handler(BaseHTTPRequestHandler):
             code = 200
         elif self.path.startswith("/inject"):
             body = json.dumps(_write_pending_incident(payload)).encode("utf-8")
+            code = 200
+        elif self.path.startswith("/approve"):
+            # Human-in-the-loop: file the governed issue / gated PR ONLY on this click.
+            try:
+                result = notifier.approve_active_incident()
+            except Exception:  # noqa: BLE001 - approval must never crash the server
+                result = {"status": "error"}
+            body = json.dumps(result).encode("utf-8")
             code = 200
         else:
             body = b'{"error":"not found"}'

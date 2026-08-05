@@ -147,6 +147,14 @@ COPILOT_TOKEN_STORE = os.environ.get("COPILOT_TOKEN_STORE", "")
 # assistant (no live model call). The detailed RCA is always Opus-authored.
 CHAT_USE_LLM = os.environ.get("CHAT_USE_LLM", "true").lower() in ("1", "true", "yes")
 
+# Human-in-the-loop governance. When true (default) the guardian PREDICTS and
+# writes the analysis but does NOT file the GitHub issue / preventive PR or the
+# Grafana incident on its own — it waits for the operator to click Approve on the
+# dashboard. Set false to let it file the governed (still never auto-merged)
+# artifacts automatically. Either way, nothing is ever merged/fixed without a human.
+GOVERNANCE_REQUIRE_APPROVAL = os.environ.get(
+    "GOVERNANCE_REQUIRE_APPROVAL", "true").lower() in ("1", "true", "yes")
+
 
 # Tardis / Chatflow brain (production seam).
 TARDIS_MODEL = os.environ.get("TARDIS_MODEL", "chatflow")
