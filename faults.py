@@ -33,16 +33,21 @@ import config
 
 def apply_fault(batch: list[dict], mode: str, tick: int,
                 inject_at: int = 3, ramp: float = 0.12,
-                spec: dict | None = None) -> list[dict]:
-    """Return a (possibly) corrupted copy of ``batch`` for the given tick."""
+                spec: dict | None = None, recovery: float = 1.0) -> list[dict]:
+    """Return a (possibly) corrupted copy of ``batch`` for the given tick.
+
+    ``recovery`` (0..1) scales the fault DOWN — 1.0 = full injected fault, 0.0 =
+    fully healed. The dashboard's "Apply fix" action decays this toward 0 over a
+    few ticks so the operator watches the pipeline visibly recover."""
     if mode in (None, "none") or tick < inject_at:
         return batch
     if mode == "latency-surge":
         return batch          # load-induced latency is modeled in load_latency()
     if mode == "custom":
-        return apply_custom(batch, spec or {}, tick, inject_at=inject_at, ramp=ramp)
+        return apply_custom(batch, spec or {}, tick, inject_at=inject_at,
+                            ramp=ramp, recovery=recovery)
 
-    frac = min(0.9, (tick - inject_at + 1) * ramp)  # grows each tick
+    frac = min(0.9, (tick - inject_at + 1) * ramp) * max(0.0, recovery)  # grows each tick
 
     if mode == "volume-drop":
         keep = max(1, int(len(batch) * (1.0 - frac)))
@@ -75,7 +80,8 @@ def modeled_latency_ms(mode: str, tick: int, inject_at: int = 1) -> float:
 
 
 def load_latency(mode: str, tick: int, real_latency_ms: float,
-                 inject_at: int = 1, spec: dict | None = None) -> tuple[float, str | None]:
+                 inject_at: int = 1, spec: dict | None = None,
+                 recovery: float = 1.0) -> tuple[float, str | None]:
     """Return ``(effective_latency_ms, timeout_error)`` for the given tick.
 
     ``effective_latency_ms`` is the measured latency plus any load-induced
@@ -87,6 +93,7 @@ def load_latency(mode: str, tick: int, real_latency_ms: float,
     added = modeled_latency_ms(mode, tick, inject_at)
     if mode == "custom":
         added += custom_latency_ms(spec or {}, tick, inject_at)
+    added *= max(0.0, recovery)
     effective = float(real_latency_ms) + added
     error = None
     if added > 0 and effective >= config.LATENCY_TIMEOUT_MS:
@@ -119,7 +126,8 @@ def custom_latency_ms(spec: dict, tick: int, inject_at: int = 1) -> float:
 
 
 def apply_custom(batch: list[dict], spec: dict, tick: int,
-                 inject_at: int = 1, ramp: float = 0.12) -> list[dict]:
+                 inject_at: int = 1, ramp: float = 0.12,
+                 recovery: float = 1.0) -> list[dict]:
     """Apply a user-authored incident ``spec`` (a list of ramping ``ops``).
 
     ``spec = {"label": "...", "ops": [ {"op": ..., "field": ..., ...}, ... ]}``.
@@ -139,7 +147,7 @@ def apply_custom(batch: list[dict], spec: dict, tick: int,
     ops = spec.get("ops") if isinstance(spec, dict) else None
     if not ops or tick < inject_at:
         return batch
-    frac_base = min(0.95, (tick - inject_at + 1) * ramp)
+    frac_base = min(0.95, (tick - inject_at + 1) * ramp) * max(0.0, recovery)
     out = [dict(r) for r in batch]
     for op in ops:
         if isinstance(op, dict):

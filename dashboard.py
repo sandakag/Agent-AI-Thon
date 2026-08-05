@@ -737,6 +737,17 @@ def _write_pending_incident(payload: dict) -> dict:
         except OSError:
             pass
         return {"status": "cleared"}
+    if payload.get("apply_fix"):
+        # Operator performed the AI's recommended remediation. Hand the live engine
+        # a sentinel it consumes to DECAY the fault to 0 over a few ticks — the
+        # dashboard then shows the pipeline recovering to GREEN in real time.
+        label = str(payload.get("label") or "recommended fix")[:80]
+        try:
+            PENDING_INCIDENT.write_text(
+                json.dumps({"apply_fix": True, "label": label}), encoding="utf-8")
+        except OSError as exc:
+            return {"status": "error", "detail": str(exc)}
+        return {"status": "fix_applied", "label": label}
     ops = payload.get("ops")
     if not isinstance(ops, list) or not ops:
         return {"status": "error", "detail": "need a non-empty 'ops' list"}
@@ -871,6 +882,11 @@ async function approveGov(){
   try{await fetch('/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}
   location.reload();
 }
+function applyFix(label){
+  var btns=document.querySelectorAll('button.fix');
+  for(var i=0;i<btns.length;i++){btns[i].disabled=true;btns[i].textContent='Applying — watch it recover…';}
+  induce({apply_fix:true,label:label});
+}
 // Restore the chat open/closed state so it survives the live auto-refresh.
 (function(){try{if(localStorage.getItem('guardianChatOpen')==='1'){var cw=document.getElementById('cw');if(cw){cw.classList.add('open');var m=document.getElementById('cwmsgs');if(m)m.scrollTop=m.scrollHeight;}}}catch(e){}})();
 // Live auto-refresh every 5s for the dashboard panels — but NEVER while the chat
@@ -889,6 +905,25 @@ async function approveGov(){
 })();
 </script>
 """
+
+
+def _fix_action_label(failure_type: object) -> str:
+    """The concrete remediation the operator performs for a predicted failure —
+    shown on the banner's 'Apply fix' button."""
+    ft = str(failure_type or "").lower()
+    if "latency" in ft or "timeout" in ft or "slow" in ft:
+        return "Scale out consumers"
+    if ("volume" in ft or "throughput" in ft or "stall" in ft
+            or "drought" in ft or "starv" in ft):
+        return "Restore upstream feed & backfill"
+    if "schema" in ft or "parse" in ft or "rename" in ft or "drift" in ft:
+        return "Apply the merged parser fix"
+    if "dup" in ft:
+        return "Apply the merged dedupe fix"
+    if ("null" in ft or "quality" in ft or "missing" in ft
+            or "corrupt" in ft or "type" in ft):
+        return "Apply the merged data-quality fix"
+    return "Apply the recommended fix"
 
 
 def render_html() -> str:
@@ -925,17 +960,25 @@ def render_html() -> str:
             links += f' &nbsp;·&nbsp; <a href="{_esc(banner["issue_url"])}" target="_blank">predicted-incident issue</a>'
         if banner.get("pr_url"):
             links += f' &nbsp;·&nbsp; <a href="{_esc(banner["pr_url"])}" target="_blank">gated preventive PR (awaiting human merge)</a>'
+        apply_label = _fix_action_label(pred.get("predicted_failure_type"))
+        apply_html = (
+            '<div class="row"><button class="fix" onclick="applyFix(\''
+            + _esc(apply_label) + '\')">⚙ Apply fix: ' + _esc(apply_label) + '</button>'
+            '<span class="fixhint">Runs the recommended remediation — watch the '
+            'pipeline recover to GREEN.</span></div>')
         if awaiting:
             action = ('<div class="appr">⏸ <b>Awaiting your approval.</b> The AI predicted this and wrote '
                       'the root-cause analysis + recommended fix (below), but has filed <b>nothing</b> yet. '
                       'Review it, then approve to open the AI-written governed issue + gated preventive PR '
                       '— nothing is ever merged or auto-fixed without you.'
                       '<div class="row"><button id="apprbtn" onclick="approveGov()">✓ Approve &amp; file governed issue / PR</button>'
-                      '<button class="alt" onclick="induce({reset:true})">Dismiss (I\'ll fix it manually)</button></div></div>')
+                      '<button class="alt" onclick="induce({reset:true})">Dismiss (I\'ll fix it manually)</button></div>'
+                      + apply_html + '</div>')
         elif approved:
-            action = f'<div class="appr ok">✓ Approved by you — AI-written governed issue / PR filed.{links}</div>'
+            action = (f'<div class="appr ok">✓ Approved by you — AI-written governed issue / PR filed.{links}'
+                      + apply_html + '</div>')
         else:
-            action = (f'<div class="bnr-sub">{links}</div>' if links else '')
+            action = (f'<div class="bnr-sub">{links}</div>' if links else '') + apply_html
         banner_body = (
             f'<div class="bnr-sub">Predicted <b>{_esc(pred.get("predicted_failure_type", "failure"))}</b>'
             f' — risk {_esc(pred.get("risk_score"))}/100, ~{_esc(pred.get("lead_time_minutes"))} min lead time.</div>'
@@ -1045,6 +1088,8 @@ def render_html() -> str:
  #gq{{flex:1;min-width:280px}} #incops{{width:100%;min-height:60px;margin-top:6px}}
  button{{background:#1f6feb;color:#fff;border:none;border-radius:8px;padding:8px 12px;cursor:pointer;font-size:13px}}
  button.alt{{background:#30363d}} button:disabled{{opacity:.6}}
+ button.fix{{background:#1f9d55;font-weight:600}} button.fix:hover{{background:#25b365}}
+ .fixhint{{font-size:12px;opacity:.85}}
  .cw{{position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column;align-items:flex-end}}
  .cwbtn{{display:flex;align-items:center;gap:8px;background:#1f6feb;color:#fff;border-radius:28px;padding:11px 18px;font-size:20px;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.45)}}
  .cwlabel{{font-size:14px;font-weight:600}}

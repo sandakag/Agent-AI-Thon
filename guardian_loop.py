@@ -55,6 +55,9 @@ from signals.collector import SignalCollector
 INTERVAL = float(os.environ.get("GUARDIAN_LOOP_INTERVAL", "6"))
 START_INJECT = str(os.environ.get("GUARDIAN_INJECT", "none") or "none")
 START_INJECT_AT = int(os.environ.get("GUARDIAN_INJECT_AT", "6"))
+# When the operator clicks "Apply fix" the injected fault decays to 0 over this
+# many ticks, so they watch the pipeline visibly recover before it settles GREEN.
+RECOVERY_TICKS = max(1, int(os.environ.get("GUARDIAN_RECOVERY_TICKS", "4")))
 
 _PENDING = config.DATA_DIR / "pending_incident.json"
 _RCA_HISTORY = config.DATA_DIR / "rca_history.json"
@@ -95,6 +98,18 @@ def _append_rca(rca: dict) -> None:
                                 encoding="utf-8")
     except OSError:
         pass
+
+
+def _recover_collector(collector) -> None:
+    """Keep only the healthy baseline (drop the incident spikes) so the pipeline
+    settles GREEN at once and re-detection of the NEXT incident stays fast."""
+    healthy = [h for h in collector.history if (
+        (h.get("latency_ms") or 0) < config.SLA_LATENCY_MS
+        and (h.get("null_rate") or 0) < 0.1
+        and (h.get("dup_rate") or 0) < 0.1)]
+    collector.history.clear()
+    for h in healthy[-30:]:
+        collector.history.append(h)
 
 
 def _maybe_generate_rca(prediction: dict, signals_window: list, brain, tick: int) -> None:
@@ -145,7 +160,8 @@ def _consume_pending() -> dict | None:
         _PENDING.unlink()
     except OSError:
         pass
-    if isinstance(spec, dict) and (spec.get("ops") or spec.get("reset")):
+    if isinstance(spec, dict) and (spec.get("ops") or spec.get("reset")
+                                   or spec.get("apply_fix")):
         return spec
     return None
 
@@ -169,6 +185,9 @@ def main() -> None:
     active_mode = START_INJECT
     active_spec: dict | None = None
     active_inject_at = START_INJECT_AT
+    recovery_left = 0
+    active_fix_label: str | None = None
+    fix_tick = 0
     tick = 0
 
     while True:
@@ -179,26 +198,29 @@ def main() -> None:
             if pend is not None:
                 if pend.get("reset"):
                     active_mode, active_spec = "none", None
-                    # Drop only the incident SPIKES from the window (not the whole
-                    # history), so the banner settles GREEN immediately AND the
-                    # healthy baseline is preserved for FAST re-detection of the
-                    # next incident (clearing everything forced a slow re-warmup).
-                    healthy = [h for h in collector.history if (
-                        (h.get("latency_ms") or 0) < config.SLA_LATENCY_MS
-                        and (h.get("null_rate") or 0) < 0.1
-                        and (h.get("dup_rate") or 0) < 0.1)]
-                    collector.history.clear()
-                    for h in healthy[-30:]:
-                        collector.history.append(h)
+                    recovery_left, active_fix_label = 0, None
+                    _recover_collector(collector)
                     clear_incident()
                     _reset_rca_dedupe()
                     audit_trail.stream_emit("guardian_incident_reset", tick=tick)
                     print(f"    >>> RESET at tick {tick} — fault cleared, "
                           "pipeline returns to healthy live data.", flush=True)
+                elif pend.get("apply_fix"):
+                    # Operator performed the AI's recommended remediation. Decay the
+                    # fault to 0 over RECOVERY_TICKS so they WATCH the pipeline heal.
+                    if active_mode != "none":
+                        recovery_left = RECOVERY_TICKS
+                        fix_tick = tick
+                        active_fix_label = str(pend.get("label") or "recommended fix")[:80]
+                        audit_trail.stream_emit("guardian_fix_applying", tick=tick,
+                                                fix=active_fix_label)
+                        print(f"    >>> APPLY FIX: {active_fix_label} — pipeline "
+                              f"recovering over {RECOVERY_TICKS} ticks...", flush=True)
                 else:
                     active_mode = "custom"
                     active_spec = pend
                     active_inject_at = tick
+                    recovery_left, active_fix_label = 0, None
                     audit_trail.stream_emit(
                         "guardian_incident_injected", tick=tick,
                         label=str(pend.get("label", "custom incident"))[:80],
@@ -207,18 +229,37 @@ def main() -> None:
                     print(f"    >>> LIVE INJECT: {pend.get('label', 'custom incident')} "
                           f"— ramp starts now at tick {tick}", flush=True)
 
+            # Recovery ramp: an applied fix decays the fault toward 0 over a few
+            # ticks so the operator sees the pipeline heal, then it stands down.
+            rf = 1.0
+            eff_tick = tick
+            if recovery_left > 0:
+                recovery_left -= 1
+                rf = recovery_left / float(RECOVERY_TICKS)
+                eff_tick = fix_tick          # freeze ramp at its peak; rf decays it
+                if recovery_left == 0:
+                    active_mode, active_spec = "none", None
+                    _recover_collector(collector)
+                    clear_incident()
+                    _reset_rca_dedupe()
+                    audit_trail.stream_emit("guardian_fix_recovered", tick=tick,
+                                            fix=active_fix_label)
+                    print(f"    >>> RECOVERED via '{active_fix_label}' — pipeline healthy.",
+                          flush=True)
+                    active_fix_label = None
+
             # 2) EXTRACT live trades + apply the ramping fault
             raw = fetch_batch()
-            raw = apply_fault(raw, active_mode, tick,
-                              inject_at=active_inject_at, spec=active_spec)
+            raw = apply_fault(raw, active_mode, eff_tick,
+                              inject_at=active_inject_at, spec=active_spec, recovery=rf)
 
             # 3) TRANSFORM + LOAD (+ modeled load-latency / hard timeout break)
             t0 = time.time()
             etl = run_etl(raw)
             latency_ms = (time.time() - t0) * 1000.0
             latency_ms, load_error = load_latency(
-                active_mode, tick, latency_ms,
-                inject_at=active_inject_at, spec=active_spec,
+                active_mode, eff_tick, latency_ms,
+                inject_at=active_inject_at, spec=active_spec, recovery=rf,
             )
             if load_error and not etl["failed"]:
                 etl["failed"] = True
