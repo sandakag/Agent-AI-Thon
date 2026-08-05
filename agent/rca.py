@@ -18,27 +18,31 @@ import config
 from agent.brain_base import BrainError
 
 _RCA_SYSTEM = (
-    "You are a principal Site Reliability Engineer writing the definitive "
-    "root-cause analysis for a data-pipeline incident that an AI guardian "
-    "PREDICTED before it fired. You are given live telemetry, the grounded "
-    "prediction and the recent signal trends. Produce a THOROUGH, specific, "
-    "actionable RCA — this is read by on-call engineers and leadership. Ground "
-    "every claim in the provided numbers; never invent telemetry. Be detailed in "
-    "'detailed_analysis' (several paragraphs: what is happening, the mechanism, "
-    "why it will breach, and the reasoning). Respond with ONLY a single JSON "
-    "object (no prose, no code fences) using EXACTLY these keys: "
-    "title (string), summary (string, 1-2 sentences), root_cause (string), "
-    "detailed_analysis (string, multi-paragraph), timeline (array of strings), "
-    "impact (string: SLA/revenue/customer blast radius), "
+    "You are a principal Site Reliability Engineer writing the definitive incident "
+    "analysis for a data-pipeline problem that an AI guardian PREDICTED BEFORE it hit "
+    "production. You are given live telemetry, the grounded prediction and recent "
+    "signal trends. Write for on-call engineers AND as a customer-facing status note. "
+    "Ground every claim in the provided numbers; never invent telemetry. Clearly state "
+    "(a) WHAT the issue is, (b) HOW the AI detected it early (the anomalous PATTERN in "
+    "the signals and the lead time it bought), (c) the exact MANUAL steps the team runs "
+    "now to prevent it, and (d) whether a CODE/config change is required (stage a pull "
+    "request) or it is a purely operational fix. Respond with ONLY a single JSON object "
+    "(no prose, no code fences) using EXACTLY these keys: "
+    "title (string), summary (string, 1-2 sentences: what the issue is), "
+    "root_cause (string), detection_method (string: how the model caught the pattern "
+    "early + the lead time it bought), detailed_analysis (string, multi-paragraph: "
+    "what is happening, the mechanism, why it will breach), timeline (array of strings), "
+    "impact (string: SLA/revenue/customer blast radius if NOT acted on), "
     "contributing_factors (array of strings), evidence (array of strings), "
-    "immediate_actions (array of strings, what the on-call does NOW), "
-    "preventive_measures (array of strings, how to stop recurrence), "
+    "immediate_actions (array of strings: the exact manual steps to do NOW), "
+    "fix_type (string: 'code' if a code/config change is needed, else 'manual'), "
+    "preventive_measures (array of strings: how to stop recurrence), "
     "confidence (string: low|medium|high with one clause why)."
 )
 
-_KEYS = ("title", "summary", "root_cause", "detailed_analysis", "timeline",
-         "impact", "contributing_factors", "evidence", "immediate_actions",
-         "preventive_measures", "confidence")
+_KEYS = ("title", "summary", "root_cause", "detection_method", "detailed_analysis",
+         "timeline", "impact", "contributing_factors", "evidence",
+         "immediate_actions", "fix_type", "preventive_measures", "confidence")
 
 
 def build_context(prediction: dict, signals_window: list[dict]) -> dict:
@@ -133,8 +137,8 @@ def _coerce(rca: dict) -> dict:
             rca[k] = [v]
         elif not isinstance(v, list):
             rca[k] = []
-    for k in ("title", "summary", "root_cause", "detailed_analysis", "impact",
-              "confidence"):
+    for k in ("title", "summary", "root_cause", "detection_method", "detailed_analysis",
+              "impact", "fix_type", "confidence"):
         if rca.get(k) is None:
             rca[k] = ""
     return rca
@@ -183,12 +187,14 @@ def _fallback_rca(prediction: dict, ctx: dict) -> dict:
         "root_cause": (prediction.get("recommended_action") and
                        f"Likely cause: sustained drift in the driving signal. "
                        f"{_root_cause_for(ft)}") or _root_cause_for(ft),
+        "detection_method": _detection_for(ft, ctx, lead),
         "detailed_analysis": analysis,
         "timeline": timeline,
         "impact": _impact_for(ft),
         "contributing_factors": ev or ["sustained deviation in the driving signal"],
         "evidence": ev or ["forecaster flagged a sustained, one-directional drift"],
         "immediate_actions": _actions_for(ft),
+        "fix_type": _fix_type_for(ft),
         "preventive_measures": _prevention_for(ft),
         "confidence": f"{prediction.get('confidence')} (grounded heuristic)",
         "source": "grounded-heuristic",
@@ -253,21 +259,70 @@ def _prevention_for(ft: str) -> list[str]:
             "Add guardrails at the relevant operating limit."]
 
 
+def _detection_for(ft: str, ctx: dict, lead) -> str:
+    """Plain-English description of HOW the model caught the pattern early."""
+    sla = ctx.get("sla", {}) if isinstance(ctx, dict) else {}
+    f = (ft or "").lower()
+    base = (
+        "The guardian learned each signal's normal operating band from the live "
+        "stream, then flagged a SUSTAINED, one-directional drift — confirmed over "
+        "several consecutive ticks, not a one-off blip — and projected its trajectory "
+        f"to the failure line, raising this ~{lead} min BEFORE the breach so the team "
+        "can act while everything is still green for customers."
+    )
+    if "latency" in f or "timeout" in f or "load" in f:
+        cur = sla.get("current_latency_ms") or 0
+        soft = sla.get("soft_sla_ms") or config.SLA_LATENCY_MS
+        return (base + f" Concretely: processing latency is {cur:.0f} ms and its trend is "
+                f"climbing toward the {soft:.0f} ms SLA — the RATE of slow transactions is "
+                "rising, so the 95% completion SLO will breach if it continues. The model "
+                "catches the trend early instead of waiting the 5-6 minutes it would take "
+                "for customers to feel it.")
+    if "null" in f or "quality" in f:
+        return (base + " Concretely: the null/malformed-record RATE is rising abnormally "
+                "vs its learned baseline and is trending toward the load gate that zeroes revenue.")
+    if "schema" in f:
+        return (base + " Concretely: the record schema-hash diverged from the learned "
+                "baseline and parse failures are climbing before rows are silently dropped.")
+    return base
+
+
+def _fix_type_for(ft: str) -> str:
+    """Whether this class of incident typically needs a CODE change or a MANUAL/ops fix."""
+    f = (ft or "").lower()
+    if "schema" in f or "null" in f or "quality" in f or "dup" in f or "parse" in f:
+        return "code"
+    return "manual"
+
+
 def render_markdown(rca: dict) -> str:
-    """Compact Markdown rendering of an RCA (for GitHub issues / logs)."""
+    """Actionable Markdown rendering of an RCA (GitHub issue / PR body / logs) — the
+    SAME analysis shown on the dashboard: what the issue is, how the AI caught it
+    early, the manual steps to run now, and whether a code fix (PR) is needed."""
     def bullets(items):
         return "\n".join(f"- {i}" for i in (items or [])) or "- (none)"
+    fix = str(rca.get("fix_type") or "").lower()
+    fix_line = (
+        "**A code/config change IS required** — a gated pull request has been staged "
+        "with the fix for a human to review and merge."
+        if fix == "code" else
+        "**No code change required** — this is an operational fix; run the manual steps "
+        "above and Resolve on the dashboard."
+        if fix == "manual" else ""
+    )
     return (
-        f"## 🔬 AI Root-Cause Analysis — {rca.get('title', 'Predicted incident')}\n"
-        f"_Reasoned by `{rca.get('source', 'llm')}`_\n\n"
-        f"**Summary:** {rca.get('summary', '')}\n\n"
+        f"## 🔬 AI incident analysis — {rca.get('title', 'Predicted incident')}\n"
+        f"_Written by `{rca.get('source', 'llm')}` — the same analysis shown on the live dashboard._\n\n"
+        f"**What is the issue:** {rca.get('summary', '')}\n\n"
         f"**Root cause:** {rca.get('root_cause', '')}\n\n"
-        f"### Detailed analysis\n{rca.get('detailed_analysis', '')}\n\n"
-        f"### Timeline\n{bullets(rca.get('timeline'))}\n\n"
-        f"### Impact\n{rca.get('impact', '')}\n\n"
-        f"### Contributing factors\n{bullets(rca.get('contributing_factors'))}\n\n"
-        f"### Evidence\n{bullets(rca.get('evidence'))}\n\n"
-        f"### Immediate actions\n{bullets(rca.get('immediate_actions'))}\n\n"
-        f"### Preventive measures\n{bullets(rca.get('preventive_measures'))}\n\n"
+        f"### 🔎 How the AI detected it EARLY (before production impact)\n"
+        f"{rca.get('detection_method', '')}\n\n"
+        f"### 📉 Detailed analysis\n{rca.get('detailed_analysis', '')}\n\n"
+        f"### ⏱ Timeline\n{bullets(rca.get('timeline'))}\n\n"
+        f"### 💥 Impact if NOT acted on\n{rca.get('impact', '')}\n\n"
+        f"### ✅ Do these steps NOW (prevent it before it breaks)\n{bullets(rca.get('immediate_actions'))}\n\n"
+        f"### 🛠 Fix type\n{fix_line}\n\n"
+        f"### 🛡 Preventive measures\n{bullets(rca.get('preventive_measures'))}\n\n"
+        f"### 📋 Evidence\n{bullets(rca.get('evidence'))}\n\n"
         f"**Confidence:** {rca.get('confidence', '')}\n"
     )

@@ -392,23 +392,32 @@ def _rca_entry_html(rca: dict, open_: bool = False) -> str:
              else "grounded" if "heuristic" in src.lower() else _esc(src))
     when = _esc((rca.get("generated_at") or "")[11:19])
     analysis = _esc(rca.get("detailed_analysis", "")).replace("\n", "<br>")
+    detection = _esc(rca.get("detection_method", "")).replace("\n", "<br>")
+    fix = str(rca.get("fix_type") or "").lower()
+    fix_line = ("🛠 <b>Code/config fix needed</b> — a gated PR is staged for review when you approve."
+                if fix == "code" else
+                "🛠 <b>Operational (manual) fix</b> — run the steps above; no code change needed."
+                if fix == "manual" else "")
     return (
         f'<details class="rcaitem"{" open" if open_ else ""}>'
         f'<summary><span class="pill" style="background:{col}">{_esc(lvl)}</span> '
         f'{_esc(rca.get("title", "Predicted incident"))} '
         f'<span class="muted">· {when} UTC · {badge}</span></summary>'
         '<div class="rcabody">'
-        f'<div class="s">{_esc(rca.get("summary", ""))}</div>'
+        f'<div class="s"><b>What is the issue:</b> {_esc(rca.get("summary", ""))}</div>'
         f'<div style="margin-top:6px"><b>Root cause:</b> {_esc(rca.get("root_cause", ""))}</div>'
-        f'<div style="margin-top:6px"><b>Detailed analysis</b><div class="a">{analysis}</div></div>'
+        + (f'<div style="margin-top:6px"><b>🔎 How the AI detected it early</b>'
+           f'<div class="a">{detection}</div></div>' if detection else '')
+        + f'<div style="margin-top:6px"><b>Detailed analysis</b><div class="a">{analysis}</div></div>'
         '<div class="rcagrid">'
         f'<div><b>Timeline</b><ol>{lis(rca.get("timeline"))}</ol></div>'
-        f'<div><b>Immediate actions (on-call)</b><ul>{lis(rca.get("immediate_actions"))}</ul></div>'
+        f'<div><b>✅ Do these steps NOW</b><ul>{lis(rca.get("immediate_actions"))}</ul></div>'
         f'<div><b>Preventive measures</b><ul>{lis(rca.get("preventive_measures"))}</ul></div>'
-        f'<div><b>Impact</b><div class="a">{_esc(rca.get("impact", ""))}</div>'
+        f'<div><b>Impact if not acted on</b><div class="a">{_esc(rca.get("impact", ""))}</div>'
         f'<b>Evidence</b><ul>{lis(rca.get("evidence"))}</ul></div>'
         '</div>'
-        f'<div class="muted" style="margin-top:6px">confidence {_esc(rca.get("confidence", ""))}</div>'
+        + (f'<div class="s" style="margin-top:8px">{fix_line}</div>' if fix_line else '')
+        + f'<div class="muted" style="margin-top:6px">confidence {_esc(rca.get("confidence", ""))}</div>'
         '</div></details>'
     )
 

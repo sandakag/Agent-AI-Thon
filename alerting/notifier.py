@@ -173,6 +173,18 @@ def _govern_async(prediction: dict, decision: dict, level: str,
     return issue_url, pr_url
 
 
+def _grounded_rca(prediction: dict) -> dict:
+    """Instant grounded RCA (no model call) so an approved issue ALWAYS carries the
+    AI analysis + steps, even if the Opus RCA has not finished generating yet."""
+    try:
+        sig = json.loads((config.DATA_DIR / "signal_history.json").read_text(encoding="utf-8"))
+        sig = sig if isinstance(sig, list) else []
+    except (OSError, json.JSONDecodeError):
+        sig = []
+    from agent import rca as rca_mod
+    return rca_mod.generate_rca(prediction, sig, None)
+
+
 def approve_active_incident() -> dict:
     """Operator approval from the dashboard: file the governed GitHub issue / gated
     PR (AI-written) + Grafana IRM incident for the ACTIVE incident. Nothing is filed
@@ -185,14 +197,21 @@ def approve_active_incident() -> dict:
         return {"status": "already_approved",
                 "issue_url": banner.get("issue_url"), "pr_url": banner.get("pr_url")}
     prediction = banner.get("prediction") or {}
+    # Always attach an AI analysis to the governed artifacts. Prefer the Opus RCA
+    # the loop already produced; if it is not ready yet, generate a grounded one NOW
+    # (instant) so the GitHub issue is never a bare template.
+    rca = _latest_rca() or _grounded_rca(prediction)
+    # Raise a PR ONLY when a code/config change is needed; a purely operational
+    # (manual) fix gets the step-by-step guidance in the issue, with no PR.
+    fix_type = str((rca or {}).get("fix_type") or "").lower()
     decision = {
         "level": level,
         "should_alert": True,
         "should_open_issue": True,
-        "should_open_pr": level == "RED",
+        "should_open_pr": (fix_type == "code"),
         "recommendation": prediction.get("recommended_action", ""),
     }
-    issue_url, pr_url = _govern_async(prediction, decision, level, _latest_rca())
+    issue_url, pr_url = _govern_async(prediction, decision, level, rca)
     banner = _read_banner()
     banner["approved"] = True
     banner["awaiting_approval"] = False
