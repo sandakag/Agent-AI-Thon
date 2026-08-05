@@ -33,7 +33,11 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    # Paused by default: the always-on guardian-loop is the single real-time engine
+    # that drives the banner/predictions. The DAG stays available in the Airflow UI
+    # as the "real Apache Airflow" showpiece — unpause + trigger it there on demand —
+    # but it must NOT auto-run every 10 min and fight the loop over the banner state.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
     AIRFLOW__WEBSERVER__WORKERS: "2"
     AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "600"

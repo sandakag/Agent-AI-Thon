@@ -657,25 +657,42 @@ def _answer_question(q: str) -> str:
     if not q:
         return "Ask about the pipeline's risk, what's likely to fail, when, or how to prevent it."
     ctx = _chat_context()
-    brain = _get_brain()
-    if brain is not None and getattr(brain, "available", False):
-        user = (f"Operator question: {q}\n\nLive telemetry (JSON):\n"
-                f"{json.dumps(ctx, default=str)}")
-        try:
-            reply = brain.chat(_CHAT_SYSTEM, user).strip()
-            return reply or _grounded_answer(q, ctx)
-        except BrainError:
-            return _grounded_answer(q, ctx)
-        except Exception:  # noqa: BLE001 - a chat hiccup must never crash the dashboard
-            return _grounded_answer(q, ctx)
+    # Fast by default: the grounded assistant answers instantly from live telemetry
+    # (and serves the pre-generated Opus RCA for "why/explain"). A live Opus call
+    # per message is opt-in (CHAT_USE_LLM) because it adds ~20-40s of latency.
+    if config.CHAT_USE_LLM:
+        brain = _get_brain()
+        if brain is not None and getattr(brain, "available", False):
+            user = (f"Operator question: {q}\n\nLive telemetry (JSON):\n"
+                    f"{json.dumps(ctx, default=str)}")
+            try:
+                reply = brain.chat(_CHAT_SYSTEM, user).strip()
+                return reply or _grounded_answer(q, ctx)
+            except BrainError:
+                return _grounded_answer(q, ctx)
+            except Exception:  # noqa: BLE001 - a chat hiccup must never crash the dashboard
+                return _grounded_answer(q, ctx)
     return _grounded_answer(q, ctx)
 
 
 def _write_pending_incident(payload: dict) -> dict:
     if payload.get("reset"):
-        # Write a reset SENTINEL (not just delete): the always-on guardian engine
-        # consumes it on its next tick, stands the fault down and clears the
-        # banner, so pressing "Clear" visibly returns the pipeline to healthy.
+        # Bulletproof CLEAR: return the pipeline to healthy immediately AND durably.
+        #  * write the GREEN banner now (instant UI feedback),
+        #  * wipe the ramp state so no engine can re-assert the old fault,
+        #  * drop the incident RCA,
+        #  * leave a reset sentinel the live engine consumes to reset its in-memory
+        #    mode on its next tick.
+        try:
+            config.INCIDENTS_FILE.write_text(json.dumps({"level": "GREEN"}),
+                                             encoding="utf-8")
+        except OSError:
+            pass
+        for p in (config.GUARDIAN_STATE_FILE, config.DATA_DIR / "latest_rca.json"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
         try:
             PENDING_INCIDENT.write_text(json.dumps({"reset": True, "label": "clear"}),
                                         encoding="utf-8")
@@ -768,17 +785,33 @@ _INJECT_BUTTONS = (
     '<button class="alt" onclick=\'induce({label:"freeze price (stale feed)",ops:[{op:"freeze_field",field:"price"}]})\'>Freeze price</button>'
     '<button class="alt" onclick=\'induce({label:"volume collapse",ops:[{op:"shrink_batch"}]})\'>Shrink batch</button>'
     '<button class="alt" onclick=\'induce({label:"duplicate storm",ops:[{op:"duplicate"}]})\'>Dup storm</button>'
-    '<button class="alt" onclick=\'induce({label:"load latency",ops:[{op:"latency",ms:1500}]})\'>Add latency</button>'
+    '<button class="alt" onclick=\'induce({label:"load latency",ops:[{op:"latency",ms:800}]})\'>Add latency</button>'
     '<button class="alt" onclick=\'induce({reset:true})\'>Clear</button>'
 )
 
 _SCRIPT = """
 <script>
+function cwToggle(){
+  var cw=document.getElementById('cw'); if(!cw)return;
+  var open=cw.classList.toggle('open');
+  try{localStorage.setItem('guardianChatOpen',open?'1':'0');}catch(e){}
+  if(open){var m=document.getElementById('cwmsgs');if(m)m.scrollTop=m.scrollHeight;var g=document.getElementById('gq');if(g)g.focus();}
+}
+function cwAppend(cls,text){
+  var m=document.getElementById('cwmsgs'); if(!m)return null;
+  var d=document.createElement('div'); d.className='cwmsg '+cls; d.textContent=text;
+  m.appendChild(d); m.scrollTop=m.scrollHeight; return d;
+}
 async function askGuardian(){
-  var el=document.getElementById('gq'); var q=(el.value||'').trim(); if(!q){return;}
-  var b=document.getElementById('gqbtn'); b.disabled=true; b.textContent='Thinking…';
-  try{await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:q})});}catch(e){}
-  location.reload();
+  var el=document.getElementById('gq'); if(!el)return; var q=(el.value||'').trim(); if(!q){return;}
+  el.value=''; cwAppend('u',q);
+  var t=cwAppend('a','typing…'); if(t)t.classList.add('cwtyping');
+  try{
+    var r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:q})});
+    var j=await r.json();
+    if(t){t.classList.remove('cwtyping'); t.textContent=j.answer||'(no answer)';}
+  }catch(e){ if(t){t.classList.remove('cwtyping'); t.textContent='Sorry — I could not reach the guardian.';} }
+  var m=document.getElementById('cwmsgs'); if(m)m.scrollTop=m.scrollHeight;
 }
 async function induce(spec){
   try{await fetch('/inject',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(spec)});}catch(e){}
@@ -791,17 +824,16 @@ function induceCustom(){
   var ops; try{ops=JSON.parse(raw);}catch(e){alert('ops must be a valid JSON array');return;}
   induce({label:label,ops:ops});
 }
-// Live auto-refresh (replaces the old <meta refresh>): reload every 5s, but NEVER
-// while you're focused on / recently typing in the chat or custom-incident boxes,
-// so your text is never wiped mid-question.
+// Restore the chat open/closed state so it survives the live auto-refresh.
+(function(){try{if(localStorage.getItem('guardianChatOpen')==='1'){var cw=document.getElementById('cw');if(cw){cw.classList.add('open');var m=document.getElementById('cwmsgs');if(m)m.scrollTop=m.scrollHeight;}}}catch(e){}})();
+// Live auto-refresh every 5s for the dashboard panels — but NEVER while the chat
+// is open or while you're typing in the custom-incident boxes.
 (function(){
-  var FIELDS=['gq','incops','inclabel'], GRACE=30000, last=0;
+  var FIELDS=['incops','inclabel'], GRACE=30000, last=0;
   function touch(){last=Date.now();}
-  FIELDS.forEach(function(id){
-    var el=document.getElementById(id);
-    if(el){el.addEventListener('input',touch);el.addEventListener('keydown',touch);el.addEventListener('focus',touch);}
-  });
+  FIELDS.forEach(function(id){var el=document.getElementById(id);if(el){el.addEventListener('input',touch);el.addEventListener('keydown',touch);el.addEventListener('focus',touch);}});
   function busy(){
+    try{if(localStorage.getItem('guardianChatOpen')==='1')return true;}catch(e){}
     var ae=document.activeElement;
     for(var i=0;i<FIELDS.length;i++){if(document.getElementById(FIELDS[i])===ae)return true;}
     return (Date.now()-last)<GRACE;
@@ -879,22 +911,15 @@ def render_html() -> str:
     chain = ('<span class="ok">✓ INTACT</span>' if a["intact"]
              else f'<span class="bad">✗ BROKEN at #{a["broken_at"]}</span>')
 
-    chat_rows = ""
-    for tn in _chat_load()[-6:]:
-        chat_rows += (f'<div class="qa"><div class="q">🧑 {_esc(tn.get("q", ""))}</div>'
-                      f'<div class="a">🤖 {_esc(tn.get("a", ""))}</div></div>')
-    chat_rows = chat_rows or ('<div class="muted">Ask the guardian anything about the '
-                              'live pipeline — e.g. “what is the biggest risk right now '
-                              'and when will it break?”</div>')
+    chat_msgs = ""
+    for tn in _chat_load()[-14:]:
+        chat_msgs += (f'<div class="cwmsg u">{_esc(tn.get("q", ""))}</div>'
+                      f'<div class="cwmsg a">{_esc(tn.get("a", ""))}</div>')
+    chat_msgs = chat_msgs or (
+        '<div class="cwmsg a">Hi! I am the Guardian. Ask me &ldquo;what is the biggest '
+        'risk right now?&rdquo;, &ldquo;are we breaching the latency SLA?&rdquo;, or '
+        '&ldquo;explain the root cause&rdquo;.</div>')
     panels_html = (
-        '<div class="sec">💬 Ask the Guardian</div>'
-        '<div class="panel">' + chat_rows +
-        '<div class="row">'
-        '<input id="gq" placeholder="what is the biggest risk right now and when will it break?" '
-        "onkeydown=\"if(event.key==='Enter')askGuardian()\">"
-        '<button id="gqbtn" onclick="askGuardian()">Ask</button></div>'
-        '<div class="muted" style="margin-top:6px">I read your question and answer from the '
-        'live telemetry (risk, the latency SLA, data quality, throughput, revenue, remediation).</div></div>'
         '<div class="sec">🧪 Induce your OWN incident (unknown to the AI)</div>'
         '<div class="panel"><div class="row">' + _INJECT_BUTTONS + '</div>'
         "<textarea id=\"incops\" placeholder='advanced: ops JSON array, e.g. "
@@ -944,9 +969,25 @@ def render_html() -> str:
  #gq{{flex:1;min-width:280px}} #incops{{width:100%;min-height:60px;margin-top:6px}}
  button{{background:#1f6feb;color:#fff;border:none;border-radius:8px;padding:8px 12px;cursor:pointer;font-size:13px}}
  button.alt{{background:#30363d}} button:disabled{{opacity:.6}}
+ .cw{{position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column;align-items:flex-end}}
+ .cwbtn{{display:flex;align-items:center;gap:8px;background:#1f6feb;color:#fff;border-radius:28px;padding:11px 18px;font-size:20px;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.45)}}
+ .cwlabel{{font-size:14px;font-weight:600}}
+ .cw.open .cwbtn{{display:none}}
+ .cwpanel{{display:none;flex-direction:column;width:370px;height:520px;max-height:72vh;background:#0d1117;border:1px solid #30363d;border-radius:16px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.55);margin-bottom:10px}}
+ .cw.open .cwpanel{{display:flex}}
+ .cwhead{{background:#161b22;padding:13px 16px;font-weight:700;font-size:14px;border-bottom:1px solid #30363d;display:flex;justify-content:space-between;align-items:center}}
+ .cwx{{cursor:pointer;color:#8b949e;font-size:22px;line-height:1}}
+ .cwmsgs{{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:9px}}
+ .cwmsg{{max-width:88%;padding:9px 12px;border-radius:13px;font-size:13px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}}
+ .cwmsg.u{{align-self:flex-end;background:#1f6feb;color:#fff;border-bottom-right-radius:3px}}
+ .cwmsg.a{{align-self:flex-start;background:#21262d;color:#e6edf3;border-bottom-left-radius:3px}}
+ .cwtyping{{color:#8b949e;font-style:italic}}
+ .cwinput{{display:flex;gap:8px;padding:11px;border-top:1px solid #30363d;background:#161b22}}
+ .cwinput input{{flex:1;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:22px;padding:10px 15px;font-size:13px}}
+ .cwinput button{{width:40px;height:40px;min-width:40px;border-radius:50%;background:#1f6feb;color:#fff;border:none;cursor:pointer;font-size:15px;padding:0}}
 </style></head><body><div class="wrap">
  <h1>🔮 Predictive Pipeline Guardian</h1>
- <div class="sub">Predicts data-pipeline failures BEFORE they happen · GitHub Copilot brain · governed by a human · updated {_esc(s["generated_at"][11:19])} UTC</div>
+ <div class="sub">Predicts data-pipeline failures BEFORE they happen · grounded predictive AI · Opus 4.8 RCA · governed by a human · updated {_esc(s["generated_at"][11:19])} UTC</div>
  <div class="bnr"><div class="bnr-title">{_esc(level)}</div>{banner_body}</div>
  {realtime_html}
  {rca_html}
@@ -972,7 +1013,16 @@ def render_html() -> str:
  <div class="sec">Governance — predicted-incident issues & gated preventive PRs</div>
  {gov}
  {panels_html}
-</div>{_SCRIPT}</body></html>"""
+</div>
+<div id="cw" class="cw">
+  <div class="cwpanel">
+    <div class="cwhead"><span>🔮 Ask the Guardian</span><span class="cwx" onclick="cwToggle()">×</span></div>
+    <div id="cwmsgs" class="cwmsgs">{chat_msgs}</div>
+    <div class="cwinput"><input id="gq" autocomplete="off" placeholder="Ask about risk, SLA, or the RCA…" onkeydown="if(event.key==='Enter')askGuardian()"><button id="gqbtn" onclick="askGuardian()">➤</button></div>
+  </div>
+  <div class="cwbtn" onclick="cwToggle()">💬<span class="cwlabel">Ask the Guardian</span></div>
+</div>
+{_SCRIPT}</body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):

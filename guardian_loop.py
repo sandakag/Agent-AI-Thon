@@ -162,6 +162,11 @@ def main() -> None:
             if pend is not None:
                 if pend.get("reset"):
                     active_mode, active_spec = "none", None
+                    # Drop the incident's signal tail so the very next tick reads
+                    # healthy — otherwise the lingering high-latency history keeps
+                    # the risk elevated and the banner flickers back to AMBER after
+                    # Clear. A brief re-warmup then relearns the live normal.
+                    collector.history.clear()
                     clear_incident()
                     _clear_rca()
                     audit_trail.stream_emit("guardian_incident_reset", tick=tick)
@@ -231,9 +236,9 @@ def main() -> None:
                     predicted_type=prediction.get("predicted_failure_type"),
                 )
                 agent.learn(signals, prediction, outcome="failed")
-                # the incident fired: stand the fault down so the pipeline visibly
-                # recovers next tick (a real remediation would have been applied).
-                active_mode, active_spec = "none", None
+                # Keep the incident ACTIVE (RED) until the operator clicks Clear, so
+                # the failure, its RCA and the governed issue/PR stay on screen for
+                # as long as needed. Clear (or a real remediation) stands it down.
             else:
                 agent.learn(signals, prediction, outcome="ok")
         except Exception as exc:  # noqa: BLE001 - a tick hiccup must never kill the engine
