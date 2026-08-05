@@ -84,6 +84,16 @@ def run_etl(raw: list[dict]) -> dict:
     """Full parse -> aggregate -> load. Returns a result dict; sets
     ``failed=True`` and skips the load when the batch is too NULL to publish."""
     parsed = parse_trades(raw)
+    # Idempotency fix: drop at-least-once duplicate redeliveries by
+    # trade_id so a replay storm never double-counts revenue.
+    _seen, _deduped = set(), []
+    for _p in parsed:
+        _tid = _p.get("trade_id")
+        if _tid is not None and _tid in _seen:
+            continue
+        _seen.add(_tid)
+        _deduped.append(_p)
+    parsed = _deduped
     total = len(parsed)
     nulls = sum(1 for p in parsed if p["amount"] is None)
     null_rate = (nulls / total) if total else 1.0
