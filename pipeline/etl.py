@@ -99,6 +99,21 @@ def run_etl(raw: list[dict]) -> dict:
         "error": None,
     }
 
+    # Resilience fix: quarantine null-amount records and publish the VALID
+    # subset instead of failing the whole batch, so a burst of bad upstream
+    # records never zeroes revenue. Alert on the quarantined count.
+    if total and null_rate >= config.NULL_RATE_CRITICAL:
+        valid = [p for p in parsed if p["amount"] is not None]
+        if valid:
+            good = aggregate(valid)
+            result["aggregate"] = good
+            result["quarantined"] = nulls
+            result["warehouse"] = load(good)
+            result["error"] = (
+                "quarantined %d null-amount records; published %d valid"
+                % (nulls, len(valid))
+            )
+            return result
     if total == 0 or null_rate >= config.NULL_RATE_CRITICAL:
         result["failed"] = True
         result["error"] = (
