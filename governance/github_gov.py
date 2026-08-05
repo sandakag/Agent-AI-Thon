@@ -222,23 +222,96 @@ def _runbook(prediction: dict, decision: dict, sig: str, rca: dict | None = None
     )
 
 
+def _etl_code_fix(sig: str, content: str):
+    """Return ``(new_content, description)`` — a REAL, targeted fix applied to the
+    current ``pipeline/etl.py`` for a code/logic incident — or ``None`` when the
+    signature is an OPERATIONAL issue (latency/volume/stale), in which case there
+    is no code change and therefore NO pull request (the steps live in the issue).
+    """
+    s = (sig or "").lower()
+
+    # --- schema drift: resolve renamed/aliased upstream fields in the parser ---
+    if "schema" in s or "rename" in s or "parse" in s:
+        anchor = ('        price = _to_float(r.get("price"))\n'
+                  '        size = _to_float(r.get("size"))')
+        if anchor not in content or "_resolve_alias" in content:
+            return None
+        helper = (
+            "def _resolve_alias(record: dict, names: tuple):\n"
+            "    \"\"\"Return the first present alias of a (possibly renamed) upstream field.\"\"\"\n"
+            "    for _n in names:\n"
+            "        if record.get(_n) is not None:\n"
+            "            return record.get(_n)\n"
+            "    return None\n\n\n"
+        )
+        new = ('        price = _to_float(_resolve_alias(r, ("price", "px", "p", "prc")))\n'
+               '        size = _to_float(_resolve_alias(r, ("size", "qty", "quantity", "sz")))')
+        fixed = content.replace(anchor, new).replace(
+            "def parse_trades(", helper + "def parse_trades(", 1)
+        return fixed, ("Resolve upstream field aliases in `parse_trades` so a renamed "
+                       "field (e.g. price->px) still parses instead of producing NULL amounts.")
+
+    # --- duplicate storm: dedupe by trade_id so a replay never double-counts ---
+    if "dup" in s:
+        anchor = "    parsed = parse_trades(raw)\n    total = len(parsed)"
+        if anchor not in content or "_deduped" in content:
+            return None
+        new = ("    parsed = parse_trades(raw)\n"
+               "    # Idempotency fix: drop at-least-once duplicate redeliveries by\n"
+               "    # trade_id so a replay storm never double-counts revenue.\n"
+               "    _seen, _deduped = set(), []\n"
+               "    for _p in parsed:\n"
+               "        _tid = _p.get(\"trade_id\")\n"
+               "        if _tid is not None and _tid in _seen:\n"
+               "            continue\n"
+               "        _seen.add(_tid)\n"
+               "        _deduped.append(_p)\n"
+               "    parsed = _deduped\n"
+               "    total = len(parsed)")
+        return content.replace(anchor, new), ("Dedupe by `trade_id` in `run_etl` so "
+               "at-least-once redelivery never double-counts revenue.")
+
+    # --- null-rate / data-quality: quarantine nulls, publish the valid subset ---
+    if "null" in s or "quality" in s:
+        anchor = ('    if total == 0 or null_rate >= config.NULL_RATE_CRITICAL:\n'
+                  '        result["failed"] = True')
+        if anchor not in content or "quarantined" in content:
+            return None
+        block = (
+            "    # Resilience fix: quarantine null-amount records and publish the VALID\n"
+            "    # subset instead of failing the whole batch, so a burst of bad upstream\n"
+            "    # records never zeroes revenue. Alert on the quarantined count.\n"
+            "    if total and null_rate >= config.NULL_RATE_CRITICAL:\n"
+            "        valid = [p for p in parsed if p[\"amount\"] is not None]\n"
+            "        if valid:\n"
+            "            good = aggregate(valid)\n"
+            "            result[\"aggregate\"] = good\n"
+            "            result[\"quarantined\"] = nulls\n"
+            "            result[\"warehouse\"] = load(good)\n"
+            "            result[\"error\"] = (\n"
+            "                \"quarantined %d null-amount records; published %d valid\"\n"
+            "                % (nulls, len(valid))\n"
+            "            )\n"
+            "            return result\n"
+        )
+        return content.replace(anchor, block + anchor), ("Quarantine null-amount records "
+               "and publish the valid subset in `run_etl` instead of failing the whole batch.")
+
+    return None
+
+
 def open_preventive_pr(prediction: dict, decision: dict,
                        rca: dict | None = None) -> str | None:
-    """Open a gated preventive PR that commits a remediation runbook. De-dupes
-    per signature; NEVER auto-merged."""
+    """Open a gated PR that commits a REAL code fix to ``pipeline/etl.py`` for a
+    code/logic incident. For an OPERATIONAL issue (latency / volume / stale feed)
+    there is no code change, so NO pull request is opened — the concrete ops steps
+    live in the issue instead. De-dupes per signature; NEVER auto-merged."""
     sig = signature(prediction)
-    branch = f"guardian/prevent-{sig}"
+    branch = f"guardian/fix-{sig}"
     if not enabled():
         audit_trail.audit("governance_pr_planned", signature=sig, enabled=False)
-        print("    -> [governance] would open GATED preventive PR "
-              f"({prediction.get('recommended_action', '')[:60]}...) — human approves")
+        print("    -> [governance] would open a gated code-fix PR — human approves")
         return None
-
-    existing = find_open_pr(branch)
-    if existing:
-        audit_trail.audit("governance_pr_deduped", signature=sig, url=existing)
-        print(f"    -> [governance] gated preventive PR already open: {existing}")
-        return existing
 
     repo = config.GITHUB_REPOSITORY
     base = _default_branch()
@@ -246,64 +319,83 @@ def open_preventive_pr(prediction: dict, decision: dict,
         audit_trail.audit("governance_pr_failed", signature=sig, reason="no_default_branch")
         return None
 
-    # 1) base ref sha
+    # Fetch the CURRENT source and compute a real, targeted fix. If this is an
+    # operational issue (no code change), skip the PR entirely — no phony PRs.
+    fpath = "pipeline/etl.py"
+    st, fmeta = _req("GET", f"/repos/{repo}/contents/{fpath}?ref={base}")
+    if st != 200 or not isinstance(fmeta, dict):
+        audit_trail.audit("governance_pr_failed", signature=sig, reason="no_source_file", status=st)
+        return None
+
+    import base64
+    try:
+        current = base64.b64decode(fmeta.get("content", "")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    fix = _etl_code_fix(sig, current)
+    if fix is None:
+        audit_trail.audit("governance_pr_skipped", signature=sig,
+                          reason="operational_fix_no_code_change")
+        print("    -> [governance] operational fix — no code change, so no PR "
+              "(the concrete steps are in the issue)")
+        return None
+    new_content, change_desc = fix
+
+    existing = find_open_pr(branch)
+    if existing:
+        audit_trail.audit("governance_pr_deduped", signature=sig, url=existing)
+        return existing
+
     status, ref = _req("GET", f"/repos/{repo}/git/ref/heads/{base}")
     if status != 200 or not isinstance(ref, dict):
-        audit_trail.audit("governance_pr_failed", signature=sig, reason="no_base_ref",
-                         status=status)
+        audit_trail.audit("governance_pr_failed", signature=sig, reason="no_base_ref", status=status)
         return None
-    base_sha = ref["object"]["sha"]
-
-    # 2) create the branch (idempotent — 422 if it already exists)
     _req("POST", f"/repos/{repo}/git/refs",
-         {"ref": f"refs/heads/{branch}", "sha": base_sha})
+         {"ref": f"refs/heads/{branch}", "sha": ref["object"]["sha"]})
 
-    # 3) commit the preventive runbook on the branch
-    import base64
-
-    path = f"prevention/{sig}.md"
-    content_b64 = base64.b64encode(
-        _runbook(prediction, decision, sig, rca).encode("utf-8")
-    ).decode("ascii")
-    # if the file already exists on the branch we need its blob sha to update
-    sha = None
-    st, existing_file = _req("GET", f"/repos/{repo}/contents/{path}?ref={branch}")
-    if st == 200 and isinstance(existing_file, dict):
-        sha = existing_file.get("sha")
-    put_body = {
-        "message": f"guardian: stage preventive fix for {prediction.get('predicted_failure_type')}",
-        "content": content_b64,
+    # Commit the modified source on the branch (update if the file already exists).
+    sha = fmeta.get("sha")
+    stb, bfile = _req("GET", f"/repos/{repo}/contents/{fpath}?ref={branch}")
+    if stb == 200 and isinstance(bfile, dict):
+        sha = bfile.get("sha")
+    put = {
+        "message": f"guardian: fix {prediction.get('predicted_failure_type')} — {change_desc}",
+        "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
         "branch": branch,
     }
     if sha:
-        put_body["sha"] = sha
-    st, _ = _req("PUT", f"/repos/{repo}/contents/{path}", put_body)
-    if st not in (200, 201):
-        audit_trail.audit("governance_pr_failed", signature=sig, reason="commit_failed",
-                         status=st)
+        put["sha"] = sha
+    stc, _ = _req("PUT", f"/repos/{repo}/contents/{fpath}", put)
+    if stc not in (200, 201):
+        audit_trail.audit("governance_pr_failed", signature=sig, reason="commit_failed", status=stc)
         return None
 
-    # 4) open the PR (gated — never merged here)
     issue_url, _num = find_open_issue(sig)
-    body = (
-        f"Preventive fix staged by the **Predictive Pipeline Guardian** for a "
-        f"forecast **{prediction.get('predicted_failure_type')}** failure "
-        f"(risk {prediction.get('risk_score')}/100, ~"
-        f"{prediction.get('lead_time_minutes')} min lead time).\n\n"
-        f"**Recommended action:** {prediction.get('recommended_action')}\n\n"
-        f"{'Related issue: ' + issue_url if issue_url else ''}\n\n"
-        f"> 🛡️ Gated: review and merge to promote. The AI never auto-merges."
+    head = (
+        f"**Gated code fix staged by the Predictive Pipeline Guardian** for a predicted "
+        f"**{prediction.get('predicted_failure_type')}** (risk {prediction.get('risk_score')}/100, "
+        f"~{prediction.get('lead_time_minutes')} min lead time).\n\n"
+        f"**This PR changes `{fpath}`:** {change_desc}\n\n"
+        + (f"Related issue: {issue_url}\n\n" if issue_url else "")
+        + "> 🛡️ Gated: review the diff and merge to apply the fix. The AI never auto-merges.\n\n---\n\n"
     )
+    body = head
+    if rca and rca.get("root_cause"):
+        try:
+            from agent import rca as rca_mod
+            body = head + rca_mod.render_markdown(rca)
+        except Exception:  # noqa: BLE001
+            pass
     st, pr = _req("POST", f"/repos/{repo}/pulls",
-                  {"title": f"[preventive] {prediction.get('predicted_failure_type')}",
+                  {"title": f"[fix] {prediction.get('predicted_failure_type')}",
                    "head": branch, "base": base, "body": body})
     if st in (200, 201) and isinstance(pr, dict):
         url = pr.get("html_url")
         audit_trail.audit("governance_pr_opened", signature=sig,
-                         number=pr.get("number"), url=url)
-        print(f"    -> [governance] GATED preventive PR opened: {url}")
+                          number=pr.get("number"), url=url, change=change_desc)
+        print(f"    -> [governance] GATED code-fix PR opened: {url}")
         return url
     audit_trail.audit("governance_pr_failed", signature=sig, reason="pr_api",
-                     status=st, detail=str(pr)[:200])
+                      status=st, detail=str(pr)[:200])
     print(f"    -> [governance] PR API error ({st}): {str(pr)[:120]}")
     return None

@@ -34,8 +34,12 @@ _RCA_SYSTEM = (
     "what is happening, the mechanism, why it will breach), timeline (array of strings), "
     "impact (string: SLA/revenue/customer blast radius if NOT acted on), "
     "contributing_factors (array of strings), evidence (array of strings), "
-    "immediate_actions (array of strings: the exact manual steps to do NOW), "
-    "fix_type (string: 'code' if a code/config change is needed, else 'manual'), "
+    "immediate_actions (array of strings: the EXACT SRE remediation steps to run "
+    "NOW, written as diagnose -> fix -> verify with concrete commands/actions; make "
+    "explicit whether each step is an UPSTREAM fix, an OPERATIONAL/config fix, or a "
+    "CODE change), "
+    "fix_type (string: 'code' if the root cause is a code/logic bug that needs a "
+    "source change, else 'manual' for an operational/upstream fix), "
     "preventive_measures (array of strings: how to stop recurrence), "
     "confidence (string: low|medium|high with one clause why)."
 )
@@ -120,6 +124,9 @@ def generate_rca(prediction: dict, signals_window: list[dict], brain) -> dict:
                 rca["source"] = getattr(brain, "model", getattr(brain, "name", "llm"))
                 rca["predicted_failure_type"] = prediction.get("predicted_failure_type")
                 rca["risk_score"] = prediction.get("risk_score")
+                # Deterministic, authoritative fix_type so PR gating is predictable
+                # (only genuine code/logic bugs open a PR; ops issues never do).
+                rca["fix_type"] = _fix_type_for(prediction.get("predicted_failure_type"))
                 return _coerce(rca)
         except BrainError:
             pass
@@ -230,17 +237,66 @@ def _impact_for(ft: str) -> str:
 def _actions_for(ft: str) -> list[str]:
     f = (ft or "").lower()
     if "latency" in f or "timeout" in f or "load" in f:
-        return ["Scale out ETL consumers and raise parallelism now.",
-                "Enable backpressure and chunk the batch to cap per-batch work.",
-                "Shed or defer non-critical load until latency is back under the SLA."]
+        return [
+            "DIAGNOSE: check consumer lag and where time is spent — e.g. "
+            "`kafka-consumer-groups.sh --describe --group etl` and the per-stage ETL "
+            "timings; confirm the bottleneck is the consumers vs a downstream sink/DB.",
+            "FIX (operational): scale out the ETL consumers / raise parallelism now to "
+            "drain the backlog — e.g. `kubectl scale deploy/etl-consumer --replicas=<2x>` "
+            "or increase the worker/thread pool.",
+            "FIX (operational): enable backpressure and chunk the batch so per-batch "
+            "processing time drops back under the SLA; cap in-flight work.",
+            "FIX (if downstream is the bottleneck): raise the sink/DB connection-pool / "
+            "IOPS, or shed non-critical load until latency recovers.",
+            "VERIFY: latency back under the SLA and the slow-transaction RATE falling, "
+            "then Resolve. (No code change — this is an operational fix.)",
+        ]
     if "schema" in f:
-        return ["Add the renamed field alias to the parser.",
-                "Quarantine unparseable records; reprocess after the alias lands."]
+        return [
+            "DIAGNOSE: diff the incoming record keys vs the expected schema — a field was "
+            "renamed/removed (e.g. price->px) and parse failures are climbing.",
+            "FIX (upstream, if you own the producer): revert the rename or re-add the field.",
+            "FIX (code, this PR): the staged PR resolves the field aliases in the parser so "
+            "the renamed field still maps — review the diff and merge.",
+            "CONTAIN: quarantine unparseable records and reprocess after the alias/contract lands.",
+            "VERIFY: parse-failure rate back to ~0 and record volume restored.",
+        ]
     if "null" in f or "quality" in f:
-        return ["Quarantine + repair malformed records before load.",
-                "Hold the load if null-rate approaches the critical gate."]
-    return ["Confirm the deviation against recent upstream/deploy changes.",
-            "Contain the source before it breaches the operating limit."]
+        return [
+            "DIAGNOSE: identify which upstream source/field is emitting null/malformed "
+            "values (the null-amount rate is rising toward the load gate that zeroes revenue).",
+            "FIX (upstream): quarantine the bad records to a dead-letter and engage the "
+            "producer team to repair the source.",
+            "FIX (code, this PR): the staged PR quarantines null-amount records and publishes "
+            "the VALID subset instead of failing the whole batch — review the diff and merge.",
+            "BACKFILL: reprocess the quarantined records once the source is fixed.",
+            "VERIFY: null-rate back under the alert threshold and revenue non-zero.",
+        ]
+    if "dup" in f:
+        return [
+            "DIAGNOSE: find the replay source — a consumer offset reset / redelivery storm "
+            "inflating the duplicate rate.",
+            "FIX (operational): correct the offset-commit / checkpoint that caused the replay.",
+            "FIX (code, this PR): the staged PR dedupes by trade_id so at-least-once "
+            "redelivery never double-counts revenue — review the diff and merge.",
+            "RECONCILE: correct any double-counted revenue in the affected window.",
+            "VERIFY: duplicate rate back to ~0 and totals reconciled.",
+        ]
+    if "volume" in f or "throughput" in f or "stall" in f:
+        return [
+            "DIAGNOSE: check the upstream producer and consumer lag — is the source emitting "
+            "fewer events, or are consumers behind?",
+            "FIX (operational): scale consumers; if upstream stalled, engage the producer "
+            "team and fail over to a backup source if available.",
+            "BACKFILL: replay the starved window once throughput recovers.",
+            "VERIFY: record volume back within its normal band. (No code change needed.)",
+        ]
+    return [
+        "DIAGNOSE: confirm the flagged signal against recent upstream / deploy changes.",
+        "FIX: contain the source (failover / backoff / quarantine) before it breaches "
+        "the operating limit.",
+        "VERIFY: the signal returns to its normal band, then Resolve.",
+    ]
 
 
 def _prevention_for(ft: str) -> list[str]:

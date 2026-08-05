@@ -197,11 +197,16 @@ def approve_active_incident() -> dict:
         return {"status": "already_approved",
                 "issue_url": banner.get("issue_url"), "pr_url": banner.get("pr_url")}
     prediction = banner.get("prediction") or {}
-    # Always attach an AI analysis to the governed artifacts. Prefer the Opus RCA
-    # the loop already produced; if it is not ready yet, generate a grounded one NOW
-    # (instant) so the GitHub issue is never a bare template.
-    rca = _latest_rca() or _grounded_rca(prediction)
-    # Raise a PR ONLY when a code/config change is needed; a purely operational
+    # Attach the AI analysis for THIS incident. The loop's newest RCA can still be
+    # for a PREVIOUS incident (the new one's Opus RCA may not have generated yet),
+    # so only use it when its signature matches; otherwise generate a grounded RCA
+    # for the current prediction NOW (instant) so the issue/PR are never stale or
+    # a bare template.
+    cur_sig = github_gov.signature(prediction)
+    rca = _latest_rca()
+    if not (rca and rca.get("signature") == cur_sig):
+        rca = _grounded_rca(prediction)
+    # Raise a PR ONLY when a code/logic change is needed; a purely operational
     # (manual) fix gets the step-by-step guidance in the issue, with no PR.
     fix_type = str((rca or {}).get("fix_type") or "").lower()
     decision = {
