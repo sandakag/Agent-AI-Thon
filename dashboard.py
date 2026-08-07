@@ -830,6 +830,7 @@ _COLOR = {"GREEN": "#1f9d55", "AMBER": "#d98c00", "RED": "#c0392b"}
 _INJECT_BUTTONS = (
     '<button class="alt" onclick=\'fillIncident("null the size field",[{op:"null_field",field:"size"}])\'>Null size</button>'
     '<button class="alt" onclick=\'fillIncident("rename price to px",[{op:"rename_field",field:"price",to:"px"}])\'>Rename price</button>'
+    '<button class="alt" onclick=\'fillIncident("vendor renames size to quantity",[{op:"rename_field",field:"size",to:"quantity"}])\'>Rename size &rarr; quantity</button>'
     '<button class="alt" onclick=\'fillIncident("price outlier spike",[{op:"scale_field",field:"price",factor:50}])\'>Price x50</button>'
     '<button class="alt" onclick=\'fillIncident("freeze price (stale feed)",[{op:"freeze_field",field:"price"}])\'>Freeze price</button>'
     '<button class="alt" onclick=\'fillIncident("volume collapse",[{op:"shrink_batch"}])\'>Shrink batch</button>'
