@@ -58,9 +58,36 @@ def reset_local() -> None:
           "cleared, audit trail truncated")
 
 
+def restore_baseline_source() -> None:
+    """Put ``pipeline/etl.py`` back to the pristine, UN-hardened demo baseline —
+    locally AND on GitHub — so the next injected incident can stage a REAL code-fix
+    PR again. Without this, once a guardian PR is merged the fix is already in the
+    file and every later run correctly finds "nothing to change" (no PR)."""
+    baseline = config.ROOT / "pipeline" / "etl_baseline.py"
+    target = config.ROOT / "pipeline" / "etl.py"
+    try:
+        content = baseline.read_text(encoding="utf-8")
+    except OSError:
+        print("    -> [cleanup] no pipeline/etl_baseline.py — source left as-is")
+        return
+    try:
+        if target.read_text(encoding="utf-8") != content:
+            target.write_text(content, encoding="utf-8")
+        print("    -> [cleanup] Source: pipeline/etl.py restored to the demo baseline")
+    except OSError as exc:
+        print(f"    -> [cleanup] could not restore pipeline/etl.py: {exc}")
+    if github_gov.fetch_main_source() != content:
+        ok = github_gov.push_source(
+            content, "demo reset: restore pipeline/etl.py to the pristine baseline")
+        print(f"    -> [cleanup] GitHub: baseline pushed to main ({'ok' if ok else 'FAILED'})")
+    else:
+        print("    -> [cleanup] GitHub: main already at the baseline")
+
+
 def main() -> None:
     print("Resetting the Predictive Pipeline Guardian demo to pristine GREEN...")
     github_gov.cleanup_all()
+    restore_baseline_source()
     grafana_gov.purge_annotations()
     grafana_gov.resolve_incidents()
     reset_local()

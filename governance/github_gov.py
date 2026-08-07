@@ -391,6 +391,71 @@ def open_preventive_pr(prediction: dict, decision: dict,
 
 
 # ---------------------------------------------------------------------------
+# Merge watcher — the human merges the gated PR on GitHub, the running pipeline
+# picks the fix up automatically and heals. This closes the loop end-to-end:
+# predict -> file issue -> stage PR -> human merges -> pipeline self-heals.
+# ---------------------------------------------------------------------------
+SOURCE_PATH = "pipeline/etl.py"
+
+
+def merged_guardian_prs() -> list[dict]:
+    """Every MERGED ``guardian/fix-*`` pull request, newest merge first."""
+    if not enabled():
+        return []
+    st, prs = _req("GET", f"/repos/{config.GITHUB_REPOSITORY}/pulls"
+                          "?state=closed&sort=updated&direction=desc&per_page=30")
+    if st != 200 or not isinstance(prs, list):
+        return []
+    out = []
+    for pr in prs:
+        if not isinstance(pr, dict) or not pr.get("merged_at"):
+            continue
+        ref = ((pr.get("head") or {}).get("ref") or "")
+        if not ref.startswith("guardian/fix-"):
+            continue
+        out.append({"number": pr.get("number"), "url": pr.get("html_url"),
+                    "title": pr.get("title"), "branch": ref,
+                    "merged_at": pr.get("merged_at")})
+    out.sort(key=lambda p: str(p.get("merged_at")), reverse=True)
+    return out
+
+
+def fetch_main_source(path: str = SOURCE_PATH) -> str | None:
+    """Return the CURRENT text of ``path`` on the repo's default branch."""
+    if not enabled():
+        return None
+    base = _default_branch()
+    if not base:
+        return None
+    st, meta = _req("GET", f"/repos/{config.GITHUB_REPOSITORY}/contents/{path}?ref={base}")
+    if st != 200 or not isinstance(meta, dict):
+        return None
+    import base64
+    try:
+        return base64.b64decode(meta.get("content", "")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def push_source(content: str, message: str, path: str = SOURCE_PATH) -> bool:
+    """Commit ``content`` straight to the default branch (used by the demo reset to
+    restore the pristine, un-hardened baseline so the next run stages a real PR)."""
+    if not enabled():
+        return False
+    base = _default_branch()
+    if not base:
+        return False
+    import base64
+    st, meta = _req("GET", f"/repos/{config.GITHUB_REPOSITORY}/contents/{path}?ref={base}")
+    put = {"message": message, "branch": base,
+           "content": base64.b64encode(content.encode("utf-8")).decode("ascii")}
+    if st == 200 and isinstance(meta, dict) and meta.get("sha"):
+        put["sha"] = meta["sha"]
+    stc, _ = _req("PUT", f"/repos/{config.GITHUB_REPOSITORY}/contents/{path}", put)
+    return stc in (200, 201)
+
+
+# ---------------------------------------------------------------------------
 # Demo cleanup — close every guardian-created artifact (surgical & idempotent)
 # ---------------------------------------------------------------------------
 def _list_all(path: str) -> list:

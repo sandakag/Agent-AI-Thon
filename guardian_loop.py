@@ -40,6 +40,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import config
 from agent import audit_trail
@@ -47,7 +48,9 @@ from agent import rca as rca_mod
 from agent.predictive_agent import PredictiveAgent
 from alerting.notifier import clear_incident, emit
 from faults import apply_fault, load_latency
+from governance import github_gov
 from ingestion.coinbase_source import fetch_batch
+import pipeline.etl as etl_mod
 from pipeline.etl import run_etl
 from policy.policy_engine import decide
 from signals.collector import SignalCollector
@@ -61,6 +64,9 @@ RECOVERY_TICKS = max(1, int(os.environ.get("GUARDIAN_RECOVERY_TICKS", "4")))
 
 _PENDING = config.DATA_DIR / "pending_incident.json"
 _RCA_HISTORY = config.DATA_DIR / "rca_history.json"
+# How often (in ticks) to ask GitHub whether the human merged the gated fix PR.
+MERGE_POLL_TICKS = max(1, int(os.environ.get("GUARDIAN_MERGE_POLL_TICKS", "2")))
+_SOURCE_FILE = Path(__file__).resolve().parent / "pipeline" / "etl.py"
 
 # The real-time risk loop runs on the fast grounded heuristic; the expensive
 # Opus RCA is generated ONCE per incident in a background thread (deduped by the
@@ -143,6 +149,33 @@ def _maybe_generate_rca(prediction: dict, signals_window: list, brain, tick: int
     threading.Thread(target=_work, daemon=True).start()
 
 
+def _apply_merged_fix(pr: dict) -> bool:
+    """The human merged the gated code-fix PR on GitHub — pull the merged source
+    into the running pipeline and hot-reload it, so the LIVE engine starts using
+    the fix immediately. Returns True when the running code actually changed."""
+    import importlib
+    merged = github_gov.fetch_main_source(github_gov.SOURCE_PATH)
+    if not merged:
+        return False
+    try:
+        current = _SOURCE_FILE.read_text(encoding="utf-8")
+    except OSError:
+        current = ""
+    if merged.strip() == current.strip():
+        return False
+    try:
+        _SOURCE_FILE.write_text(merged, encoding="utf-8")
+        importlib.reload(etl_mod)
+    except Exception:  # noqa: BLE001 - a bad merge must never kill the loop
+        return False
+    audit_trail.stream_emit("guardian_fix_merged", pr=pr.get("url"),
+                            number=pr.get("number"), file=github_gov.SOURCE_PATH)
+    print(f"    >>> MERGED FIX PULLED from {pr.get('url')} — "
+          f"{github_gov.SOURCE_PATH} hot-reloaded into the live pipeline.",
+          flush=True)
+    return True
+
+
 def _consume_pending() -> dict | None:
     """One-shot read+delete of ``data/pending_incident.json``.
 
@@ -189,10 +222,36 @@ def main() -> None:
     active_fix_label: str | None = None
     fix_tick = 0
     tick = 0
+    # PRs already merged BEFORE this process started are history, not events.
+    try:
+        seen_merged = {p["number"] for p in github_gov.merged_guardian_prs()}
+    except Exception:  # noqa: BLE001
+        seen_merged = set()
 
     while True:
         tick += 1
         try:
+            # 0) did the human MERGE the gated fix PR on GitHub? If so, pull the
+            #    merged source into the running pipeline and heal automatically.
+            if tick % MERGE_POLL_TICKS == 0:
+                try:
+                    for pr in github_gov.merged_guardian_prs():
+                        if pr["number"] in seen_merged:
+                            continue
+                        seen_merged.add(pr["number"])
+                        if _apply_merged_fix(pr) and active_mode != "none":
+                            recovery_left = RECOVERY_TICKS
+                            fix_tick = tick
+                            active_fix_label = f"merged PR #{pr['number']}"
+                            audit_trail.stream_emit("guardian_fix_applying",
+                                                    tick=tick, fix=active_fix_label)
+                            print(f"    >>> AUTO-HEAL from {active_fix_label} — "
+                                  f"pipeline recovering over {RECOVERY_TICKS} ticks...",
+                                  flush=True)
+                        break
+                except Exception:  # noqa: BLE001 - watcher must never break the loop
+                    pass
+
             # 1) audience-authored incident / reset arriving from the dashboard
             pend = _consume_pending()
             if pend is not None:
@@ -255,7 +314,7 @@ def main() -> None:
 
             # 3) TRANSFORM + LOAD (+ modeled load-latency / hard timeout break)
             t0 = time.time()
-            etl = run_etl(raw)
+            etl = etl_mod.run_etl(raw)
             latency_ms = (time.time() - t0) * 1000.0
             latency_ms, load_error = load_latency(
                 active_mode, eff_tick, latency_ms,
