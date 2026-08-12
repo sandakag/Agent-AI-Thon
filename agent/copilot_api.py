@@ -12,7 +12,8 @@ with the full strength of Opus.
 How it authenticates (no PAT, no API key — your existing Copilot subscription):
 
   1. Find a GitHub OAuth token (first that works wins):
-       * ``COPILOT_OAUTH_TOKEN`` / ``GITHUB_COPILOT_TOKEN`` env vars,
+       * ``COPILOT_OAUTH_TOKEN`` / ``GITHUB_COPILOT_TOKEN`` / ``COPILOT_GITHUB_TOKEN``
+         env vars (the last is the name used by the self-heal workflow secret),
        * a token file at ``COPILOT_TOKEN_STORE`` (``{"access_token": "..."}``),
        * the standalone device-login cache ``~/.copilot-standalone/token.json``,
        * ``apps.json`` / ``hosts.json`` written by the official Copilot plugins
@@ -109,6 +110,9 @@ def _candidate_oauth_tokens() -> list[str]:
 
     add(os.environ.get("COPILOT_OAUTH_TOKEN"))
     add(os.environ.get("GITHUB_COPILOT_TOKEN"))
+    # Name used by the self-heal workflow secret (see .github/workflows/self-heal.yml
+    # and README) — accept it too so that secret actually reaches this brain.
+    add(os.environ.get("COPILOT_GITHUB_TOKEN"))
     store = os.environ.get("COPILOT_TOKEN_STORE") or config.COPILOT_TOKEN_STORE
     if store:
         add(_read_token_file(Path(store)))
@@ -221,7 +225,8 @@ class CopilotApiBrain:
         if not token:
             raise BrainError("No GitHub Copilot credential found. Sign in on the "
                              "host (python -m copilot login) or set "
-                             "GITHUB_COPILOT_TOKEN / COPILOT_TOKEN_STORE.")
+                             "GITHUB_COPILOT_TOKEN / COPILOT_GITHUB_TOKEN / "
+                             "COPILOT_TOKEN_STORE.")
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user}]
         text = self._complete(messages, temperature, with_max_tokens=True)
