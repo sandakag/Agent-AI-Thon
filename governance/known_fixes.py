@@ -40,12 +40,14 @@ _FIX_LABELS = {
 }
 
 
-def _label_for(failure_type: str) -> str:
+def _label_for(failure_type: str) -> str | None:
+    """The change description for a RECOGNIZED failure type, else None so a novel
+    incident falls through to a generative model instead of being wrongly claimed."""
     ft = (failure_type or "").lower()
     for key, label in _FIX_LABELS.items():
         if key in ft:
             return label
-    return "restore the hardened, resilient pipeline parser"
+    return None
 
 
 def hardened_source() -> str | None:
@@ -57,11 +59,15 @@ def hardened_source() -> str | None:
 
 
 def deterministic_fix(failure_type: str, current_content: str) -> tuple[str, str] | None:
-    """Return ``(new_etl_py_contents, change_description)`` for a predicted
-    incident, or None when no known fix applies or the source is already hardened."""
+    """Return ``(new_etl_py_contents, change_description)`` for a RECOGNIZED
+    incident, or None when the failure type is unknown, no hardened reference
+    exists, or the source is already hardened."""
+    label = _label_for(failure_type)
+    if label is None:
+        return None  # unknown incident -> let a generative model try instead
     hardened = hardened_source()
     if not hardened:
         return None
     if hardened.strip() == (current_content or "").strip():
         return None  # already hardened — nothing to change
-    return hardened if hardened.endswith("\n") else hardened + "\n", _label_for(failure_type)
+    return hardened if hardened.endswith("\n") else hardened + "\n", label

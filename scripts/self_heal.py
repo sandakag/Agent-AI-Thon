@@ -129,10 +129,11 @@ REPOSITORY SOURCE:
 {source_context()}
 """
     system = "You are a careful senior Python maintainer."
-    # Prefer a configured AI model for every repair.  If every model is offline,
-    # rate-limited, or returns an unsafe patch, the known-fix playbook is the
-    # deterministic final fallback for pre-verified incident signatures.
-    brains = [CopilotCliBrain(), CopilotApiBrain(), GroqBrain(), GeminiBrain(), PlaybookBrain()]
+    # ML known-fix analyzer runs FIRST: for a previously-diagnosed incident it
+    # returns the complete verified repair instantly (no model call, no rate
+    # limit). Only when the failure is NOT a known signature do we fall through
+    # to the generative models (Copilot CLI/API, Groq, Gemini).
+    brains = [PlaybookBrain(), CopilotCliBrain(), CopilotApiBrain(), GroqBrain(), GeminiBrain()]
     problems: list[str] = []
     for brain in brains:
         if not brain.available:

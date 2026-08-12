@@ -215,16 +215,31 @@ def _runbook(prediction: dict, decision: dict, sig: str, rca: dict | None = None
 
 
 def _copilot_code_fix(prediction: dict, rca: dict | None, content: str) -> tuple[str, str] | None:
-    """Have the configured GitHub Copilot subscription author the production fix.
+    """Author the production fix for ``pipeline/etl.py``.
 
-    The local Copilot CLI is preferred; the mounted Copilot API credential is the
-    headless Docker fallback. If neither Copilot brain can author a usable repair
-    (unavailable, rate limited, or invalid output), a deterministic known-fix
-    fallback restores the verified hardened parser so the demo never stalls. The
-    model may replace only ``pipeline/etl.py`` and its response is syntax-checked
-    before the GitHub client can create a branch.
+    The ML known-fix analyzer runs FIRST: for a previously-diagnosed incident it
+    restores the verified hardened parser instantly (no model call, no rate
+    limit), so the guardian always produces a correct, mergeable PR. Only for a
+    NOVEL incident it has never seen does it fall through to the generative
+    GitHub Copilot brains (local CLI preferred, mounted API credential as the
+    headless fallback). Every result is syntax-checked before a branch is made.
     """
     failure_type = prediction.get("predicted_failure_type")
+
+    # 1) ML KNOWN-FIX ANALYZER FIRST — instant, verified, no model call.
+    from governance import known_fixes
+    known = known_fixes.deterministic_fix(failure_type, content)
+    if known is not None:
+        new_content, desc = known
+        try:
+            compile(new_content, "pipeline/etl.py", "exec")
+            audit_trail.audit("governance_pr_known_fix", failure_type=str(failure_type), change=desc)
+            print(f"    -> [governance] ML known-fix analyzer authored the repair: {desc}")
+            return new_content + ("" if new_content.endswith("\n") else "\n"), desc
+        except SyntaxError as exc:
+            audit_trail.audit("governance_pr_known_fix_invalid", detail=str(exc)[:200])
+
+    # 2) Generative Copilot fallback for a NOVEL incident the analyzer doesn't know.
     brain = CopilotCliBrain()
     if not brain.available:
         brain = CopilotApiBrain()
@@ -260,23 +275,9 @@ def _copilot_code_fix(prediction: dict, rca: dict | None, content: str) -> tuple
         except SyntaxError as exc:
             audit_trail.audit("governance_pr_copilot_invalid", detail=str(exc)[:200])
 
-    # Deterministic known-fix fallback (mock the AI reliably): restore the verified
-    # hardened parser so a predicted CODE incident always yields a mergeable PR.
-    from governance import known_fixes
-    fallback = known_fixes.deterministic_fix(failure_type, content)
-    if fallback is None:
-        audit_trail.audit("governance_pr_skipped", reason="no_safe_change")
-        print("    -> [governance] no safe code repair available — no PR created")
-        return None
-    new_content, desc = fallback
-    try:
-        compile(new_content, "pipeline/etl.py", "exec")
-    except SyntaxError as exc:
-        audit_trail.audit("governance_pr_skipped", reason="fallback_invalid_python", detail=str(exc))
-        return None
-    audit_trail.audit("governance_pr_deterministic_fix", failure_type=str(failure_type), change=desc)
-    print(f"    -> [governance] deterministic known-fix authored the repair: {desc}")
-    return new_content, desc
+    audit_trail.audit("governance_pr_skipped", reason="no_safe_change")
+    print("    -> [governance] no safe code repair available — no PR created")
+    return None
 
 
 def open_preventive_pr(prediction: dict, decision: dict,
