@@ -17,10 +17,14 @@ from pathlib import Path
 
 from agent.brain_base import BrainError
 from agent.copilot_cli import CopilotCliBrain, CopilotCliError
+from agent.gemini import GeminiBrain
 from agent.groq import GroqBrain
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_CONTEXT_CHARS = 120_000
+# Groq's entry tier permits 12k tokens per minute. Keep the entire repair prompt
+# comfortably below that limit so a failed CI can actually reach the fallback.
+MAX_CONTEXT_CHARS = 24_000
+MAX_FAILURE_LOG_CHARS = 12_000
 ALLOWED_PREFIXES = ("agent/", "alerting/", "governance/", "ingestion/", "pipeline/", "policy/", "signals/", "tests/")
 ALLOWED_TOP_LEVEL = {"config.py", "dashboard.py", "faults.py", "guardian_loop.py", "run_demo.py", "verify_access.py"}
 
@@ -82,7 +86,7 @@ Hard rules:
 - Output only a diff beginning with 'diff --git'.
 
 FAILED CI LOG:
-{failure_log[:30_000]}
+{failure_log[:MAX_FAILURE_LOG_CHARS]}
 
 REPOSITORY SOURCE:
 {source_context()}
@@ -99,10 +103,16 @@ REPOSITORY SOURCE:
         try:
             return groq.chat(system, prompt, temperature=0.1)
         except BrainError as exc:
-            raise RuntimeError(f"Groq fallback failed: {exc}") from exc
+            print(f"Groq fallback failed; trying Gemini: {exc}", file=sys.stderr)
+    gemini = GeminiBrain()
+    if gemini.available:
+        try:
+            return gemini.chat(system, prompt, temperature=0.1)
+        except BrainError as exc:
+            raise RuntimeError(f"Gemini fallback failed: {exc}") from exc
     raise RuntimeError(
         "No repair AI is available. Sign in to the local Copilot CLI or set "
-        "GROQ_API_KEY as a GitHub Actions secret."
+        "GROQ_API_KEY / GEMINI_API_KEY as GitHub Actions secrets."
     )
 
 

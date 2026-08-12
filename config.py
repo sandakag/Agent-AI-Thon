@@ -146,6 +146,11 @@ COPILOT_TOKEN_STORE = os.environ.get("COPILOT_TOKEN_STORE", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_API_TIMEOUT = int(os.environ.get("GROQ_API_TIMEOUT", "120"))
 
+# Optional Gemini fallback. Keep GEMINI_API_KEY in a local .env file or GitHub
+# Actions secret; never commit it.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_API_TIMEOUT = int(os.environ.get("GEMINI_API_TIMEOUT", "120"))
+
 # Chat box: by default the chat now uses the real Claude Opus 4.8 brain so it can
 # answer ANY question (e.g. "what does RCA stand for?") like a proper assistant.
 # Greetings and quick status pings stay instant on the grounded path; everything
