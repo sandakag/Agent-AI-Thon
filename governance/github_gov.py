@@ -20,12 +20,16 @@ still tells the full story.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
 import config
 from agent import audit_trail
+from agent.brain_base import BrainError
+from agent.copilot_api import CopilotApiBrain
+from agent.copilot_cli import CopilotCliBrain
 
 _API = "https://api.github.com"
 _MARK = "predictive-guardian"
@@ -210,82 +214,54 @@ def _runbook(prediction: dict, decision: dict, sig: str, rca: dict | None = None
     )
 
 
-def _etl_code_fix(sig: str, content: str):
-    """Return ``(new_content, description)`` — a REAL, targeted fix applied to the
-    current ``pipeline/etl.py`` for a code/logic incident — or ``None`` when the
-    signature is an OPERATIONAL issue (latency/volume/stale), in which case there
-    is no code change and therefore NO pull request (the steps live in the issue).
+def _copilot_code_fix(prediction: dict, rca: dict | None, content: str) -> tuple[str, str] | None:
+    """Have the configured GitHub Copilot subscription author the production fix.
+
+    The local Copilot CLI is preferred; the mounted Copilot API credential is the
+    headless Docker fallback. The model may replace only ``pipeline/etl.py`` and
+    its response is syntax-checked before the GitHub client can create a branch.
     """
-    s = (sig or "").lower()
-
-    # --- schema drift: resolve renamed/aliased upstream fields in the parser ---
-    if "schema" in s or "rename" in s or "parse" in s:
-        anchor = ('        price = _to_float(r.get("price"))\n'
-                  '        size = _to_float(r.get("size"))')
-        if anchor not in content or "_resolve_alias" in content:
-            return None
-        helper = (
-            "def _resolve_alias(record: dict, names: tuple):\n"
-            "    \"\"\"Return the first present alias of a (possibly renamed) upstream field.\"\"\"\n"
-            "    for _n in names:\n"
-            "        if record.get(_n) is not None:\n"
-            "            return record.get(_n)\n"
-            "    return None\n\n\n"
-        )
-        new = ('        price = _to_float(_resolve_alias(r, ("price", "px", "p", "prc")))\n'
-               '        size = _to_float(_resolve_alias(r, ("size", "qty", "quantity", "sz")))')
-        fixed = content.replace(anchor, new).replace(
-            "def parse_trades(", helper + "def parse_trades(", 1)
-        return fixed, ("Resolve upstream field aliases in `parse_trades` so a renamed "
-                       "field (e.g. price->px) still parses instead of producing NULL amounts.")
-
-    # --- duplicate storm: dedupe by trade_id so a replay never double-counts ---
-    if "dup" in s:
-        anchor = "    parsed = parse_trades(raw)\n    total = len(parsed)"
-        if anchor not in content or "_deduped" in content:
-            return None
-        new = ("    parsed = parse_trades(raw)\n"
-               "    # Idempotency fix: drop at-least-once duplicate redeliveries by\n"
-               "    # trade_id so a replay storm never double-counts revenue.\n"
-               "    _seen, _deduped = set(), []\n"
-               "    for _p in parsed:\n"
-               "        _tid = _p.get(\"trade_id\")\n"
-               "        if _tid is not None and _tid in _seen:\n"
-               "            continue\n"
-               "        _seen.add(_tid)\n"
-               "        _deduped.append(_p)\n"
-               "    parsed = _deduped\n"
-               "    total = len(parsed)")
-        return content.replace(anchor, new), ("Dedupe by `trade_id` in `run_etl` so "
-               "at-least-once redelivery never double-counts revenue.")
-
-    # --- null-rate / data-quality: quarantine nulls, publish the valid subset ---
-    if "null" in s or "quality" in s:
-        anchor = ('    if total == 0 or null_rate >= config.NULL_RATE_CRITICAL:\n'
-                  '        result["failed"] = True')
-        if anchor not in content or "quarantined" in content:
-            return None
-        block = (
-            "    # Resilience fix: quarantine null-amount records and publish the VALID\n"
-            "    # subset instead of failing the whole batch, so a burst of bad upstream\n"
-            "    # records never zeroes revenue. Alert on the quarantined count.\n"
-            "    if total and null_rate >= config.NULL_RATE_CRITICAL:\n"
-            "        valid = [p for p in parsed if p[\"amount\"] is not None]\n"
-            "        if valid:\n"
-            "            good = aggregate(valid)\n"
-            "            result[\"aggregate\"] = good\n"
-            "            result[\"quarantined\"] = nulls\n"
-            "            result[\"warehouse\"] = load(good)\n"
-            "            result[\"error\"] = (\n"
-            "                \"quarantined %d null-amount records; published %d valid\"\n"
-            "                % (nulls, len(valid))\n"
-            "            )\n"
-            "            return result\n"
-        )
-        return content.replace(anchor, block + anchor), ("Quarantine null-amount records "
-               "and publish the valid subset in `run_etl` instead of failing the whole batch.")
-
-    return None
+    brain = CopilotCliBrain()
+    if not brain.available:
+        brain = CopilotApiBrain()
+    if not brain.available:
+        audit_trail.audit("governance_pr_skipped", reason="copilot_unavailable")
+        print("    -> [governance] GitHub Copilot unavailable — no PR created")
+        return None
+    context = {
+        "prediction": prediction,
+        "rca": rca or {},
+        "target_file": "pipeline/etl.py",
+    }
+    prompt = (
+        "Diagnose this live production incident and author the minimal safe repair. "
+        "Return ONLY the complete replacement contents of pipeline/etl.py, with no "
+        "Markdown fences or commentary. Preserve the public API, do not weaken error "
+        "handling, and change no other file.\n\n"
+        f"INCIDENT CONTEXT:\n{json.dumps(context, default=str)}\n\n"
+        f"CURRENT pipeline/etl.py:\n{content}"
+    )
+    try:
+        updated = brain.chat(
+            "You are GitHub Copilot, the production repair author for a Python data pipeline.",
+            prompt,
+            temperature=0.1,
+        ).strip()
+    except BrainError as exc:
+        audit_trail.audit("governance_pr_skipped", reason="copilot_error", detail=str(exc)[:200])
+        return None
+    # Tolerate an accidental markdown fence but never accept commentary around code.
+    fenced = re.fullmatch(r"```(?:python)?\s*\n?(.*?)\n?```", updated, re.DOTALL)
+    if fenced:
+        updated = fenced.group(1).strip()
+    if not updated or updated == content.strip():
+        return None
+    try:
+        compile(updated, "pipeline/etl.py", "exec")
+    except SyntaxError as exc:
+        audit_trail.audit("governance_pr_skipped", reason="copilot_invalid_python", detail=str(exc))
+        return None
+    return updated + "\n", f"GitHub Copilot repair for {prediction.get('predicted_failure_type')}"
 
 
 def open_preventive_pr(prediction: dict, decision: dict,
@@ -308,8 +284,8 @@ def open_preventive_pr(prediction: dict, decision: dict,
         audit_trail.audit("governance_pr_failed", signature=sig, reason="no_default_branch")
         return None
 
-    # Fetch the CURRENT source and compute a real, targeted fix. If this is an
-    # operational issue (no code change), skip the PR entirely — no phony PRs.
+    # Fetch the current source and have GitHub Copilot author a constrained
+    # replacement. The API client only permits this one target file to be changed.
     fpath = "pipeline/etl.py"
     st, fmeta = _req("GET", f"/repos/{repo}/contents/{fpath}?ref={base}")
     if st != 200 or not isinstance(fmeta, dict):
@@ -321,12 +297,11 @@ def open_preventive_pr(prediction: dict, decision: dict,
         current = base64.b64decode(fmeta.get("content", "")).decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         return None
-    fix = _etl_code_fix(sig, current)
+    fix = _copilot_code_fix(prediction, rca, current)
     if fix is None:
         audit_trail.audit("governance_pr_skipped", signature=sig,
-                          reason="operational_fix_no_code_change")
-        print("    -> [governance] operational fix — no code change, so no PR "
-              "(the concrete steps are in the issue)")
+                          reason="copilot_no_safe_change")
+        print("    -> [governance] Copilot did not return a safe code repair — no PR")
         return None
     new_content, change_desc = fix
 

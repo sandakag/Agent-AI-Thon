@@ -64,6 +64,9 @@ x-airflow-common: &airflow-common
     # --- GitHub governance (real predicted-incident issue + gated PR) ---
     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
+    GOVERNANCE_REQUIRE_APPROVAL: ${GOVERNANCE_REQUIRE_APPROVAL:-false}
+    GUARDIAN_MERGE_POLL_TICKS: ${GUARDIAN_MERGE_POLL_TICKS:-2}
+    GUARDIAN_RECOVERY_TICKS: ${GUARDIAN_RECOVERY_TICKS:-4}
     # --- Grafana (in-network address) ---
     GRAFANA_URL: ${GRAFANA_INTERNAL_URL:-http://grafana:3000}
     GRAFANA_USER: ${GRAFANA_USER:-admin}
@@ -281,7 +284,7 @@ services:
     working_dir: /opt/airflow/project
     environment:
       <<: *airflow-common-env
-      GUARDIAN_LOOP_INTERVAL: "6"
+      GUARDIAN_LOOP_INTERVAL: ${GUARDIAN_LOOP_INTERVAL:-6}
       GUARDIAN_INJECT: "none"
     depends_on:
       postgres:

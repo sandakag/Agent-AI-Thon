@@ -11,4 +11,6 @@ airflow/plugins/__pycache__/
 
 # Local state
 *.pid
+.self-heal.patch
+failed-ci.log
 .DS_Store

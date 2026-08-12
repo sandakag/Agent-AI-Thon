@@ -112,6 +112,73 @@ cd airflow
 
 ---
 
+## Track C — repeatable post-production self-healing demonstration
+
+This track uses one **controlled demo fault**, not a real security vulnerability:
+the parser temporarily stops accepting the upstream field alias `quantity` for
+`size`. It is intentionally not covered by the small CI suite, so CI is green
+and the defect reaches the demo production stack. The live incident then proves
+the separate, post-production guardian path.
+
+### 0) One-time prerequisites
+
+- Complete Track B configuration, including `GITHUB_TOKEN` and
+  `GITHUB_REPOSITORY` in `.env`.
+- Set `GOVERNANCE_REQUIRE_APPROVAL=true` in `.env` to make the approval button
+  visible. Restart the Docker stack after changing `.env`.
+- Use an isolated demo repository/branch where you are permitted to push the
+  intentional demonstration commit to `main`.
+
+### 1) Deploy the controlled fault (one command)
+
+```powershell
+python scripts/demo_vulnerability.py enable
+python scripts/demo_vulnerability.py status       # prints: DEMO FAULT ENABLED
+python -m unittest discover -s tests -v            # stays green by design
+git add pipeline/etl.py
+git commit -m "demo: introduce controlled quantity-alias fault"
+git push origin main
+
+# Restart the local production-demo stack so guardian-loop imports the deployed commit.
+cd airflow
+./stack_up.sh
+cd ..
+```
+
+The script changes only one known line and does **not** commit, push, or contact
+GitHub. Review `git diff` before committing.
+
+### 2) Induce the production incident
+
+1. Open the live dashboard.
+2. Under **Induce your OWN incident**, click **Rename size → quantity**. It only
+   loads the preset; click **Induce custom incident** to fire it.
+3. Watch the live pipeline progress **GREEN → AMBER → RED**. At RED, click
+   **Approve & file governed issue / PR**.
+4. GitHub Copilot receives the incident telemetry and current ETL source, then
+   authors a bounded `pipeline/etl.py` repair. GitHub receives the resulting
+   issue and `guardian/fix-*` PR. Review and merge it yourself.
+
+### 3) Show automatic recovery after your merge
+
+Within `GUARDIAN_MERGE_POLL_TICKS × GUARDIAN_LOOP_INTERVAL` (normally about 12
+seconds), the guardian detects the merged PR, hot-reloads `pipeline/etl.py`, and
+starts recovery. In the next `GUARDIAN_RECOVERY_TICKS` ticks it clears the
+incident and returns to **GREEN**. Point to the dashboard banner and the
+`guardian_fix_merged` / `guardian_fix_recovered` events in the logs.
+
+### 4) Prepare for the next audience
+
+After the fix is merged, repeat Step 1. `enable` is idempotent: it deliberately
+reintroduces only this controlled demo fault, so every session starts fresh.
+If you need to abandon a run before merging, restore your local source with:
+
+```powershell
+python scripts/demo_vulnerability.py disable
+```
+
+---
+
 ## Talking points
 
 - **Proactive, not reactive** — the agent forecasts and *prevents*; the reactive

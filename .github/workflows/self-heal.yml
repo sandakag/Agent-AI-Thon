@@ -1,0 +1,72 @@
+name: Self-heal failed CI
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+# The workflow must use a fine-grained PAT, rather than github.token, to create
+# a PR that triggers the normal PR CI workflow. See README for the exact scope.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: self-heal-main
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    # Do not recursively repair a failed repair branch, or run when CI is green.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      !startsWith(github.event.workflow_run.head_commit.message, 'self-heal:')
+    # GitHub-hosted runners cannot access the presenter's Copilot login. Label
+    # the local runner with `self-hosted` and `copilot` after signing in to the
+    # Copilot CLI on that machine.
+    runs-on: [self-hosted, copilot]
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.SELF_HEAL_PAT }}
+    steps:
+      - name: Check GitHub and local Copilot access
+        shell: pwsh
+        run: |
+          if (-not $env:GH_TOKEN) { throw 'Missing SELF_HEAL_PAT secret' }
+          copilot --version
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          token: ${{ secrets.SELF_HEAL_PAT }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download failed-test logs
+        shell: pwsh
+        run: gh run view ${{ github.event.workflow_run.id }} --log-failed | Out-File -Encoding utf8 failed-ci.log
+      - name: Ask the repair agent for a minimal patch
+        run: python scripts/self_heal.py --failure-log failed-ci.log
+      - name: Verify the proposed repair locally
+        run: python -m unittest discover -s tests -v
+      - name: Open repair pull request
+        id: pr
+        shell: pwsh
+        run: |
+          $branch = "self-heal/ci-${{ github.event.workflow_run.id }}"
+          git config user.name 'self-heal-ci[bot]'
+          git config user.email 'self-heal-ci[bot]@users.noreply.github.com'
+          git checkout -b $branch
+          git add -- ':!failed-ci.log'
+          git commit -m "self-heal: repair failed CI run ${{ github.event.workflow_run.id }}"
+          git push --set-upstream origin $branch
+          $url = gh pr create --base main --head $branch --title "[self-heal] Copilot repair for CI run ${{ github.event.workflow_run.id }}" --body "GitHub Copilot authored the repair from failed CI logs: ${{ github.event.workflow_run.html_url }}`n`nThe safety guard accepted the patch and the full test suite passed before this PR was created."
+          "url=$url" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+      - name: Wait for PR CI, then merge only on success
+        shell: pwsh
+        run: |
+          $prNumber = gh pr view '${{ steps.pr.outputs.url }}' --json number --jq .number
+          gh pr checks $prNumber --watch --fail-fast
+          gh pr merge $prNumber --squash --delete-branch

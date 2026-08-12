@@ -15,6 +15,30 @@ legwork and *stops*; a human approves the merge.
 Every step is written to a **tamper-evident, hash-chained audit trail** and
 surfaced on a **live dashboard + Grafana**.
 
+## Self-healing CI/CD (pre-production)
+
+Two GitHub Actions workflows now protect `main`:
+
+1. **CI** runs `python -m unittest discover -s tests -v` for every push and pull request.
+2. **Self-heal failed CI** runs only when a `main` CI run fails. It downloads the failed-test log, asks a restricted AI repair agent for a minimal Python diff, rejects unsafe diffs, reruns the full test suite, opens a `self-heal/...` PR, waits for PR CI, then squash-merges it only when that CI is green.
+
+One-time GitHub setup (repository **Settings → Secrets and variables → Actions**):
+
+- `SELF_HEAL_PAT`: a fine-grained token for this repository with **Actions: Read**, **Contents: Read and write**, and **Pull requests: Read and write**. It is used so the Copilot-authored PR triggers the normal CI workflow.
+
+The CI self-heal job runs on your **self-hosted runner** labelled `copilot`.
+Install and sign in to the GitHub Copilot CLI on that runner first; GitHub-hosted
+runners cannot access a Copilot login stored on your local machine. Copilot
+authors the patch from the failed test log; the workflow validates it, creates
+the PR, and merges only after CI passes.
+
+Also protect `main` in **Settings → Branches**: require the **CI / Python tests** status check before merging, and allow the bot/token owner to merge. The workflow deliberately refuses to edit workflow files, dependencies, secrets, or more than three Python source/test files. A failed repair stays as a failed job; it never reaches `main`.
+
+For the separate post-production, human-approved self-healing demonstration,
+see **Track C** in [RUNBOOK.md](RUNBOOK.md). It has a one-command, reversible
+controlled schema-compatibility fault for each new audience; it is not a real
+security vulnerability.
+
 ```
 EXTRACT  Coinbase live trades ──► Kafka (trades-raw)
    │
