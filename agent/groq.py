@@ -41,6 +41,7 @@ class GroqBrain:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "User-Agent": "Agent-AI-Thon/1.0",
             },
             method="POST",
         )
