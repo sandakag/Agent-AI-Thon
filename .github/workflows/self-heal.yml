@@ -52,7 +52,7 @@ jobs:
         shell: pwsh
         run: gh run view ${{ github.event.workflow_run.id }} --log-failed | Out-File -Encoding utf8 failed-ci.log
       - name: Ask the repair agent for a minimal patch
-        run: python scripts/self_heal.py --failure-log failed-ci.log
+        run: python -m scripts.self_heal --failure-log failed-ci.log
       - name: Verify the proposed repair locally
         run: python -m unittest discover -s tests -v
       - name: Open repair pull request
