@@ -45,7 +45,7 @@ def _resolve_alias(record: dict, names: tuple):
 def parse_trades(raw: list[dict]) -> list[dict]:
     parsed: list[dict] = []
     for r in raw:
-        price = _to_float(_resolve_alias(r, ("price", "px", "p", "prc")))
+        price = _to_float(_resolve_alias(r, ("price", "p", "prc")))
         size = _to_float(_resolve_alias(r, ("size", "qty", "quantity", "sz")))
         amount = price * size if (price is not None and size is not None) else None
         parsed.append(
