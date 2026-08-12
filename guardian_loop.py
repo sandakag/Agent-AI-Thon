@@ -315,7 +315,10 @@ def main() -> None:
             # 3) TRANSFORM + LOAD (+ modeled load-latency / hard timeout break)
             t0 = time.time()
             etl = etl_mod.run_etl(raw)
-            latency_ms = (time.time() - t0) * 1000.0
+            _real_ms = (time.time() - t0) * 1000.0  # measured, but jitters on a busy host
+            # Use a STABLE baseline so real container jitter never fabricates a
+            # latency incident; a real latency incident is injected via load_latency.
+            latency_ms = config.GUARDIAN_BASELINE_LATENCY_MS
             latency_ms, load_error = load_latency(
                 active_mode, eff_tick, latency_ms,
                 inject_at=active_inject_at, spec=active_spec, recovery=rf,

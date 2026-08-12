@@ -185,6 +185,13 @@ SLA_LATENCY_MS = float(os.environ.get("SLA_LATENCY_MS", "4000"))     # soft SLA 
 # latency trend, well before it actually fires.
 LATENCY_TIMEOUT_MS = float(os.environ.get("LATENCY_TIMEOUT_MS", "9000"))
 
+# Stable nominal ETL processing latency (ms) reported when NO latency incident is
+# injected. The real wall-clock of run_etl is trivially fast but jitters wildly on
+# a loaded demo host (100-800ms), which would trip spurious "latency degradation"
+# incidents and flicker the banner. Using a stable baseline means the latency
+# signal only moves when the operator actually injects a latency incident.
+GUARDIAN_BASELINE_LATENCY_MS = float(os.environ.get("GUARDIAN_BASELINE_LATENCY_MS", "25"))
+
 # ---------------------------------------------------------------------------
 # Risk bands used by the preventive policy engine
 # ---------------------------------------------------------------------------
