@@ -13,4 +13,5 @@ airflow/plugins/__pycache__/
 *.pid
 .self-heal.patch
 failed-ci.log
+.github-runner/
 .DS_Store
