@@ -140,6 +140,12 @@ COPILOT_API_TIMEOUT = int(os.environ.get("COPILOT_API_TIMEOUT", "120"))
 # Used to hand the host's subscription token to the headless Docker containers.
 COPILOT_TOKEN_STORE = os.environ.get("COPILOT_TOKEN_STORE", "")
 
+# Optional Groq fallback. Keep GROQ_API_KEY in a local .env file or GitHub
+# Actions secret; never commit it. The default model is available on Groq's
+# OpenAI-compatible chat-completions endpoint.
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_TIMEOUT = int(os.environ.get("GROQ_API_TIMEOUT", "120"))
+
 # Chat box: by default the chat now uses the real Claude Opus 4.8 brain so it can
 # answer ANY question (e.g. "what does RCA stand for?") like a proper assistant.
 # Greetings and quick status pings stay instant on the grounded path; everything

@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ secrets.SELF_HEAL_PAT }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
     steps:
       - name: Check GitHub and local Copilot access
         shell: pwsh

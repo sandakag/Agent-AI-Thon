@@ -15,7 +15,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from agent.brain_base import BrainError
 from agent.copilot_cli import CopilotCliBrain, CopilotCliError
+from agent.groq import GroqBrain
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_CONTEXT_CHARS = 120_000
@@ -68,14 +70,8 @@ def validate_diff(diff: str) -> None:
             raise ValueError(f"Unsafe repair target rejected: {path}")
 
 
-def call_copilot(failure_log: str) -> str:
-    """Ask the presenter's signed-in local Copilot CLI to author the repair."""
-    brain = CopilotCliBrain()
-    if not brain.available:
-        raise RuntimeError(
-            "Local GitHub Copilot CLI is unavailable. Sign in on this self-hosted "
-            "runner before enabling self-healing."
-        )
+def call_repair_agent(failure_log: str) -> str:
+    """Ask Copilot first, then Groq if the local Copilot CLI is unavailable."""
     prompt = f"""You are a CI repair agent. Diagnose the failed Python unittest run below and return ONE minimal unified git diff that fixes the cause.
 
 Hard rules:
@@ -91,14 +87,23 @@ FAILED CI LOG:
 REPOSITORY SOURCE:
 {source_context()}
 """
-    try:
-        return brain.chat(
-            "You are GitHub Copilot acting as a careful senior Python maintainer.",
-            prompt,
-            temperature=0.1,
-        )
-    except CopilotCliError as exc:
-        raise RuntimeError(f"Local GitHub Copilot CLI failed: {exc}") from exc
+    system = "You are a careful senior Python maintainer."
+    copilot = CopilotCliBrain()
+    if copilot.available:
+        try:
+            return copilot.chat(system, prompt, temperature=0.1)
+        except CopilotCliError as exc:
+            print(f"Copilot unavailable; trying Groq fallback: {exc}", file=sys.stderr)
+    groq = GroqBrain()
+    if groq.available:
+        try:
+            return groq.chat(system, prompt, temperature=0.1)
+        except BrainError as exc:
+            raise RuntimeError(f"Groq fallback failed: {exc}") from exc
+    raise RuntimeError(
+        "No repair AI is available. Sign in to the local Copilot CLI or set "
+        "GROQ_API_KEY as a GitHub Actions secret."
+    )
 
 
 def main() -> int:
@@ -106,7 +111,7 @@ def main() -> int:
     parser.add_argument("--failure-log", type=Path, required=True)
     args = parser.parse_args()
     failure_log = args.failure_log.read_text(encoding="utf-8", errors="replace")
-    diff = extract_diff(call_copilot(failure_log))
+    diff = extract_diff(call_repair_agent(failure_log))
     validate_diff(diff)
     patch = ROOT / ".self-heal.patch"
     patch.write_text(diff, encoding="utf-8")
