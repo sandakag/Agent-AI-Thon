@@ -142,3 +142,4 @@ def run_etl(raw: list[dict]) -> dict:
 
     result["warehouse"] = load(agg)
     return result
+# guardian-runtime-remediation: upstream-stall---throughput-collapse
