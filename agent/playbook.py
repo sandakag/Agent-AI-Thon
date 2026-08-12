@@ -25,8 +25,9 @@ _PLAYBOOK = [
         # Schema drift: upstream renamed price -> px, dropping the alias.
         "signature": "test_schema_aliases_produce_revenue",
         "path": "pipeline/etl.py",
-        "find": '        price = _to_float(_resolve_alias(r, ("price", "p", "prc")))\n',
-        "replace": '        price = _to_float(_resolve_alias(r, ("price", "px", "p", "prc")))\n',
+        "find": '        price = _to_float(r.get("price"))\n',
+        "replace": ('        price = _to_float(r.get("price") if r.get("price") '
+                    'is not None else r.get("px"))\n'),
     },
     {
         # Schema drift: upstream renamed size -> quantity, dropping the alias.

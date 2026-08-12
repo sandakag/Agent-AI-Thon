@@ -114,6 +114,25 @@ cd airflow
 
 ## Track C — repeatable post-production self-healing demonstration
 
+### One-command complete reset (Phase 1 + Phase 2)
+
+After pulling the latest `main`, run this from the repository root:
+
+```powershell
+python reset.py
+git add pipeline/etl.py
+git commit -m "demo: reset controlled CI and runtime incidents"
+git push origin main
+```
+
+`reset.py` is idempotent and never contacts GitHub. It clears local dashboard
+state, restores the six Phase 2 runtime presets, and inserts one deliberately
+failing Phase 1 `price -> px` compatibility test. The CI repair workflow first
+tries its configured AI providers; if they are unavailable it uses the verified
+known-fix playbook to open a human-review-only PR. Once that PR is merged, CI is
+green and the remaining baseline resilience gaps can be demonstrated through
+the six dashboard presets.
+
 This track uses one **controlled demo fault**, not a real security vulnerability:
 the parser temporarily stops accepting the upstream field alias `quantity` for
 `size`. It is intentionally not covered by the small CI suite, so CI is green

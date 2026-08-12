@@ -61,7 +61,11 @@ class PredictiveAgent:
             "lead_time_minutes": lead_minutes,
             "evidence": grounded["evidence"],
             "recommended_action": _default_action(grounded["predicted_failure_type"]),
-            "source": "heuristic",
+            # This is an online, telemetry-driven forecasting fallback (not a
+            # generative answer). It remains available when every AI provider is
+            # offline, so detection, RCA and governance never stall for known
+            # incidents.
+            "source": "fallback-forecaster",
         }
 
         # Reason with the AI brain ONLY when the deterministic risk is already

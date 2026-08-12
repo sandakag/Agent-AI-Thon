@@ -7,6 +7,8 @@ from unittest.mock import patch
 from pipeline import etl
 from scripts import demo_vulnerability
 from governance import github_gov
+from incidents import KNOWN_RUNTIME_INCIDENTS, ids
+from reset import phase_one_demo_source
 
 
 class EtlSmokeTests(unittest.TestCase):
@@ -53,3 +55,37 @@ class DemoVulnerabilityTests(unittest.TestCase):
             result = github_gov._copilot_code_fix({}, None, vulnerable)
         self.assertIsNotNone(result)
         self.assertEqual(result[0], repaired)
+
+
+class RepeatableDemoTests(unittest.TestCase):
+    def test_reset_source_has_one_controlled_ci_fault(self) -> None:
+        baseline = (demo_vulnerability.ROOT / "pipeline" / "etl_baseline.py").read_text(
+            encoding="utf-8"
+        )
+        source = phase_one_demo_source(baseline)
+        self.assertIn('price = _to_float(r.get("price"))', source)
+        self.assertIn('r.get("qty")', source)
+        compile(source, "pipeline/etl.py", "exec")
+        namespace = {"__name__": "demo_etl"}
+        exec(source, namespace)
+        self.assertIsNone(namespace["parse_trades"]([
+            {"product": "BTC-USD", "px": "100", "qty": "0.25"}
+        ])[0]["amount"])
+        repaired = source.replace(
+            '        price = _to_float(r.get("price"))\n',
+            '        price = _to_float(r.get("price") if r.get("price") '
+            'is not None else r.get("px"))\n',
+            1,
+        )
+        namespace = {"__name__": "demo_etl"}
+        exec(repaired, namespace)
+        self.assertEqual(namespace["parse_trades"]([
+            {"product": "BTC-USD", "px": "100", "qty": "0.25"}
+        ])[0]["amount"], 25.0)
+
+    def test_six_known_runtime_incidents_are_available(self) -> None:
+        self.assertEqual(len(KNOWN_RUNTIME_INCIDENTS), 6)
+        self.assertEqual(len(set(ids())), 6)
+        for incident in KNOWN_RUNTIME_INCIDENTS:
+            self.assertTrue(incident["label"])
+            self.assertTrue(incident["ops"])

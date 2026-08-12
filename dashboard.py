@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
+from incidents import KNOWN_RUNTIME_INCIDENTS
 from agent import audit_trail
 from agent.brain import make_brain, BrainError
 from alerting import notifier
@@ -797,7 +798,8 @@ def render_metrics() -> str:
     last_reason = _last_event(events, "agent_reason")
     preds = [e for e in events if e.get("event") == "prediction"]
     llm_preds = sum(1 for e in preds if ":" in str(e.get("source", "")))
-    heur_preds = sum(1 for e in preds if str(e.get("source", "")) == "heuristic")
+    heur_preds = sum(1 for e in preds if str(e.get("source", "")) in
+                     ("heuristic", "fallback-forecaster"))
     level_num = {"GREEN": 0, "AMBER": 1, "RED": 2}.get(
         str((s["banner"] or {}).get("level", "GREEN")).upper(), 0)
     st = _stream_totals()
@@ -827,17 +829,18 @@ def _esc(x: object) -> str:
 _COLOR = {"GREEN": "#1f9d55", "AMBER": "#d98c00", "RED": "#c0392b"}
 
 
-_INJECT_BUTTONS = (
-    '<button class="alt" onclick=\'fillIncident("null the size field",[{op:"null_field",field:"size"}])\'>Null size</button>'
-    '<button class="alt" onclick=\'fillIncident("rename price to px",[{op:"rename_field",field:"price",to:"px"}])\'>Rename price</button>'
-    '<button class="alt" onclick=\'fillIncident("vendor renames size to quantity",[{op:"rename_field",field:"size",to:"quantity"}])\'>Rename size &rarr; quantity</button>'
-    '<button class="alt" onclick=\'fillIncident("price outlier spike",[{op:"scale_field",field:"price",factor:50}])\'>Price x50</button>'
-    '<button class="alt" onclick=\'fillIncident("freeze price (stale feed)",[{op:"freeze_field",field:"price"}])\'>Freeze price</button>'
-    '<button class="alt" onclick=\'fillIncident("volume collapse",[{op:"shrink_batch"}])\'>Shrink batch</button>'
-    '<button class="alt" onclick=\'fillIncident("duplicate storm",[{op:"duplicate"}])\'>Dup storm</button>'
-    '<button class="alt" onclick=\'fillIncident("load latency",[{op:"latency",ms:800}])\'>Add latency</button>'
-    '<button onclick=\'induce({reset:true})\'>Clear / Resolve</button>'
-)
+def _known_incident_buttons() -> str:
+    """Render exactly the repeatable six-incident Phase 2 catalog."""
+    buttons = []
+    for item in KNOWN_RUNTIME_INCIDENTS:
+        label = json.dumps(item["label"])
+        ops = json.dumps(item["ops"], separators=(",", ":"))
+        buttons.append(
+            f'<button class="alt" onclick=\'fillIncident({label},{ops})\'>'
+            f'{_esc(item["button"])}</button>'
+        )
+    buttons.append('<button onclick=\'induce({reset:true})\'>Clear / Resolve</button>')
+    return "".join(buttons)
 
 _SCRIPT = """
 <script>
@@ -1035,12 +1038,12 @@ def render_html() -> str:
         'risk right now?&rdquo;, &ldquo;are we breaching the latency SLA?&rdquo;, or '
         '&ldquo;explain the root cause&rdquo;.</div>')
     panels_html = (
-        '<div class="sec">🧪 Induce your OWN incident (unknown to the AI)</div>'
+        '<div class="sec">🧪 Phase 2 — six prepared runtime incidents</div>'
         '<div class="panel">'
-        '<div class="muted" style="margin-bottom:6px">Step 1 — click a preset to LOAD it into the box '
-        '(it does <b>not</b> fire yet), or write your own ops. Step 2 — click <b>Induce custom incident</b> '
-        'to actually inject it. <b>Clear / Resolve</b> ends the active incident.</div>'
-        '<div class="row">' + _INJECT_BUTTONS + '</div>'
+        '<div class="muted" style="margin-bottom:6px">Each prepared incident is runtime-only: CI stays green. '
+        'Click a preset to load it, then induce it. When an AI provider is unavailable, the built-in '
+        'forecasting/known-fix fallback still detects, writes RCA, opens the issue and stages a review-only PR.</div>'
+        '<div class="row">' + _known_incident_buttons() + '</div>'
         "<textarea id=\"incops\" placeholder='ops JSON array, e.g. "
         "[{&quot;op&quot;:&quot;null_field&quot;,&quot;field&quot;:&quot;size&quot;},"
         "{&quot;op&quot;:&quot;latency&quot;,&quot;ms&quot;:800}]'></textarea>"

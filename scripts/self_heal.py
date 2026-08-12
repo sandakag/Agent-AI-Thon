@@ -129,11 +129,10 @@ REPOSITORY SOURCE:
 {source_context()}
 """
     system = "You are a careful senior Python maintainer."
-    # Known-issue auto-remediation first: PlaybookBrain deterministically fixes
-    # any failure whose signature it already has a verified fix for (fast and
-    # safe, in demos and production). The generative brains are the fallback for
-    # novel failures the playbook has never seen.
-    brains = [PlaybookBrain(), CopilotCliBrain(), CopilotApiBrain(), GroqBrain(), GeminiBrain()]
+    # Prefer a configured AI model for every repair.  If every model is offline,
+    # rate-limited, or returns an unsafe patch, the known-fix playbook is the
+    # deterministic final fallback for pre-verified incident signatures.
+    brains = [CopilotCliBrain(), CopilotApiBrain(), GroqBrain(), GeminiBrain(), PlaybookBrain()]
     problems: list[str] = []
     for brain in brains:
         if not brain.available:

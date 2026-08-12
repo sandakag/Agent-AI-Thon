@@ -204,7 +204,7 @@ def _fallback_rca(prediction: dict, ctx: dict) -> dict:
         "fix_type": _fix_type_for(ft),
         "preventive_measures": _prevention_for(ft),
         "confidence": f"{prediction.get('confidence')} (grounded heuristic)",
-        "source": "grounded-heuristic",
+        "source": "fallback-forecaster",
         "predicted_failure_type": ft,
         "risk_score": prediction.get("risk_score"),
     })

@@ -34,6 +34,9 @@ _FIX_LABELS = {
     "anomaly": "restore outlier-tolerant aggregation so a price spike cannot skew revenue",
     "outlier": "restore outlier-tolerant aggregation so a price spike cannot skew revenue",
     "stale": "restore feed-freshness handling so a frozen field cannot mislead revenue",
+    "corrupt": "restore malformed-value quarantine so invalid source values cannot poison revenue",
+    "type": "restore malformed-value quarantine so invalid source values cannot poison revenue",
+    "source": "restore resilient source handling so upstream errors are contained",
 }
 
 

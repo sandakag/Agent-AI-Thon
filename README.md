@@ -20,7 +20,7 @@ surfaced on a **live dashboard + Grafana**.
 Two GitHub Actions workflows now protect `main`:
 
 1. **CI** runs `python -m unittest discover -s tests -v` for every push and pull request.
-2. **Self-heal failed CI** runs only when a `main` CI run fails. It downloads the failed-test log, asks a restricted AI repair agent for a minimal Python diff, rejects unsafe diffs, reruns the full test suite, opens a `self-heal/...` PR, waits for PR CI, then squash-merges it only when that CI is green.
+2. **Self-heal failed CI** runs only when a `main` CI run fails. It downloads the failed-test log, asks a restricted AI repair agent for a minimal Python diff, rejects unsafe diffs, reruns the full test suite, opens a `self-heal/...` PR, and waits for PR CI. It then stops for a human reviewer to approve and merge; it never merges a repair itself.
 
 One-time GitHub setup (repository **Settings → Secrets and variables → Actions**):
 
