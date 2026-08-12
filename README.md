@@ -25,10 +25,11 @@ Two GitHub Actions workflows now protect `main`:
 One-time GitHub setup (repository **Settings → Secrets and variables → Actions**):
 
 - `SELF_HEAL_PAT`: a fine-grained token for this repository with **Actions: Read**, **Contents: Read and write**, and **Pull requests: Read and write**. It is used so the Copilot-authored PR triggers the normal CI workflow.
+- `COPILOT_GITHUB_TOKEN`: a fine-grained Copilot-compatible token with **Copilot Requests** permission, or the same `SELF_HEAL_PAT` if it also has that permission. This lets the self-heal job call the Copilot CLI in a headless workflow when the runner does not already have an interactive Copilot login.
 
 The CI self-heal job runs on your **self-hosted runner** labelled `copilot`.
-Install and sign in to the GitHub Copilot CLI on that runner first; GitHub-hosted
-runners cannot access a Copilot login stored on your local machine. Copilot
+If you do have an authenticated Copilot CLI on that runner, sign in there first.
+GitHub-hosted runners cannot access a Copilot login stored on your local machine. Copilot
 authors the patch from the failed test log; the workflow validates it, creates
 the PR, and merges only after CI passes.
 
