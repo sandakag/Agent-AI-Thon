@@ -218,50 +218,65 @@ def _copilot_code_fix(prediction: dict, rca: dict | None, content: str) -> tuple
     """Have the configured GitHub Copilot subscription author the production fix.
 
     The local Copilot CLI is preferred; the mounted Copilot API credential is the
-    headless Docker fallback. The model may replace only ``pipeline/etl.py`` and
-    its response is syntax-checked before the GitHub client can create a branch.
+    headless Docker fallback. If neither Copilot brain can author a usable repair
+    (unavailable, rate limited, or invalid output), a deterministic known-fix
+    fallback restores the verified hardened parser so the demo never stalls. The
+    model may replace only ``pipeline/etl.py`` and its response is syntax-checked
+    before the GitHub client can create a branch.
     """
+    failure_type = prediction.get("predicted_failure_type")
     brain = CopilotCliBrain()
     if not brain.available:
         brain = CopilotApiBrain()
-    if not brain.available:
-        audit_trail.audit("governance_pr_skipped", reason="copilot_unavailable")
-        print("    -> [governance] GitHub Copilot unavailable — no PR created")
+    if brain.available:
+        context = {
+            "prediction": prediction,
+            "rca": rca or {},
+            "target_file": "pipeline/etl.py",
+        }
+        prompt = (
+            "Diagnose this live production incident and author the minimal safe repair. "
+            "Return ONLY the complete replacement contents of pipeline/etl.py, with no "
+            "Markdown fences or commentary. Preserve the public API, do not weaken error "
+            "handling, and change no other file.\n\n"
+            f"INCIDENT CONTEXT:\n{json.dumps(context, default=str)}\n\n"
+            f"CURRENT pipeline/etl.py:\n{content}"
+        )
+        try:
+            updated = brain.chat(
+                "You are GitHub Copilot, the production repair author for a Python data pipeline.",
+                prompt,
+                temperature=0.1,
+            ).strip()
+            # Tolerate an accidental markdown fence but never accept commentary around code.
+            fenced = re.fullmatch(r"```(?:python)?\s*\n?(.*?)\n?```", updated, re.DOTALL)
+            if fenced:
+                updated = fenced.group(1).strip()
+            if updated and updated != content.strip():
+                compile(updated, "pipeline/etl.py", "exec")
+                return updated + "\n", f"GitHub Copilot repair for {failure_type}"
+        except BrainError as exc:
+            audit_trail.audit("governance_pr_copilot_error", detail=str(exc)[:200])
+        except SyntaxError as exc:
+            audit_trail.audit("governance_pr_copilot_invalid", detail=str(exc)[:200])
+
+    # Deterministic known-fix fallback (mock the AI reliably): restore the verified
+    # hardened parser so a predicted CODE incident always yields a mergeable PR.
+    from governance import known_fixes
+    fallback = known_fixes.deterministic_fix(failure_type, content)
+    if fallback is None:
+        audit_trail.audit("governance_pr_skipped", reason="no_safe_change")
+        print("    -> [governance] no safe code repair available — no PR created")
         return None
-    context = {
-        "prediction": prediction,
-        "rca": rca or {},
-        "target_file": "pipeline/etl.py",
-    }
-    prompt = (
-        "Diagnose this live production incident and author the minimal safe repair. "
-        "Return ONLY the complete replacement contents of pipeline/etl.py, with no "
-        "Markdown fences or commentary. Preserve the public API, do not weaken error "
-        "handling, and change no other file.\n\n"
-        f"INCIDENT CONTEXT:\n{json.dumps(context, default=str)}\n\n"
-        f"CURRENT pipeline/etl.py:\n{content}"
-    )
+    new_content, desc = fallback
     try:
-        updated = brain.chat(
-            "You are GitHub Copilot, the production repair author for a Python data pipeline.",
-            prompt,
-            temperature=0.1,
-        ).strip()
-    except BrainError as exc:
-        audit_trail.audit("governance_pr_skipped", reason="copilot_error", detail=str(exc)[:200])
-        return None
-    # Tolerate an accidental markdown fence but never accept commentary around code.
-    fenced = re.fullmatch(r"```(?:python)?\s*\n?(.*?)\n?```", updated, re.DOTALL)
-    if fenced:
-        updated = fenced.group(1).strip()
-    if not updated or updated == content.strip():
-        return None
-    try:
-        compile(updated, "pipeline/etl.py", "exec")
+        compile(new_content, "pipeline/etl.py", "exec")
     except SyntaxError as exc:
-        audit_trail.audit("governance_pr_skipped", reason="copilot_invalid_python", detail=str(exc))
+        audit_trail.audit("governance_pr_skipped", reason="fallback_invalid_python", detail=str(exc))
         return None
-    return updated + "\n", f"GitHub Copilot repair for {prediction.get('predicted_failure_type')}"
+    audit_trail.audit("governance_pr_deterministic_fix", failure_type=str(failure_type), change=desc)
+    print(f"    -> [governance] deterministic known-fix authored the repair: {desc}")
+    return new_content, desc
 
 
 def open_preventive_pr(prediction: dict, decision: dict,

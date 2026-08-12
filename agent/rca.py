@@ -344,9 +344,19 @@ def _detection_for(ft: str, ctx: dict, lead) -> str:
 
 
 def _fix_type_for(ft: str) -> str:
-    """Whether this class of incident typically needs a CODE change or a MANUAL/ops fix."""
+    """Whether this class of incident needs a CODE change (staged PR) or a
+    MANUAL/ops fix. The pipeline now ships a hardened parser that defends against
+    every injected incident class (schema drift, null surge, dup storm, outliers,
+    volume stall and load/latency), so each predicted incident stages a gated
+    code-fix PR that a human reviews and merges."""
     f = (ft or "").lower()
-    if "schema" in f or "null" in f or "quality" in f or "dup" in f or "parse" in f:
+    if not f or f == "none":
+        return "manual"
+    _code_signatures = (
+        "schema", "null", "quality", "dup", "parse", "latency", "timeout",
+        "throughput", "stall", "volume", "anomaly", "outlier", "spike", "stale",
+    )
+    if any(sig in f for sig in _code_signatures):
         return "code"
     return "manual"
 
