@@ -41,9 +41,13 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           token: ${{ secrets.SELF_HEAL_PAT }}
           fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      # This job runs on the presenter's Windows machine so it can use that
+      # machine's authenticated Copilot CLI. Do not use setup-python here: its
+      # Windows Store PowerShell shim cannot be inspected by the runner. The
+      # project is standard-library-only, so the installed local Python is enough.
+      - name: Check local Python
+        shell: pwsh
+        run: python --version
       - name: Download failed-test logs
         shell: pwsh
         run: gh run view ${{ github.event.workflow_run.id }} --log-failed | Out-File -Encoding utf8 failed-ci.log
