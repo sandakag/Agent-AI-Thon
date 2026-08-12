@@ -16,13 +16,24 @@ from agent.brain_base import BrainError
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Each entry: a failure-log fingerprint -> the exact known fix for it.
+# Knowledge base of known incident signatures -> the exact verified fix. Each
+# entry recognizes a failing-test fingerprint in the CI log and restores the
+# correct source line. This is the production auto-remediation model: it only
+# acts on issues it has a proven fix for, so a match is always safe to ship.
 _PLAYBOOK = [
     {
+        # Schema drift: upstream renamed price -> px, dropping the alias.
         "signature": "test_schema_aliases_produce_revenue",
         "path": "pipeline/etl.py",
         "find": '        price = _to_float(_resolve_alias(r, ("price", "p", "prc")))\n',
         "replace": '        price = _to_float(_resolve_alias(r, ("price", "px", "p", "prc")))\n',
+    },
+    {
+        # Schema drift: upstream renamed size -> quantity, dropping the alias.
+        "signature": "test_schema_aliases_produce_revenue",
+        "path": "pipeline/etl.py",
+        "find": '        size = _to_float(_resolve_alias(r, ("size", "qty", "sz")))\n',
+        "replace": '        size = _to_float(_resolve_alias(r, ("size", "qty", "quantity", "sz")))\n',
     },
 ]
 
