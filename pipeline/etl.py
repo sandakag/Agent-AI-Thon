@@ -29,11 +29,19 @@ def _to_float(v):
         return None
 
 
+def _resolve_alias(record: dict, names: tuple):
+    """Return the first present alias of a (possibly renamed) upstream field."""
+    for _n in names:
+        if record.get(_n) is not None:
+            return record.get(_n)
+    return None
+
+
 def parse_trades(raw: list[dict]) -> list[dict]:
     parsed: list[dict] = []
     for r in raw:
-        price = _to_float(r.get("price"))
-        size = _to_float(r.get("size") if r.get("size") is not None else r.get("qty"))
+        price = _to_float(_resolve_alias(r, ("price", "px", "p", "prc")))
+        size = _to_float(_resolve_alias(r, ("size", "qty", "quantity", "sz")))
         amount = price * size if (price is not None and size is not None) else None
         parsed.append(
             {
