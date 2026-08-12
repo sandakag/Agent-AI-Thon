@@ -93,9 +93,11 @@ x-airflow-common: &airflow-common
     - ./plugins:/opt/airflow/plugins
     - ..:/opt/airflow/project
     # Host GitHub Copilot subscription token (read-only) so the in-container brain
-    # can reach Claude Opus 4.8 via the Copilot API. Default is this host's token
-    # dir; override COPILOT_TOKEN_DIR in .env if your token.json lives elsewhere.
-    - ${COPILOT_TOKEN_DIR:-C:/Users/sandakag/.copilot-standalone}:/opt/airflow/.copilot-standalone:ro
+    # can reach Claude Opus 4.8 via the Copilot API. Defaults dynamically to the
+    # CURRENT user's standalone token dir (Windows %USERPROFILE%, else $HOME), so
+    # it works on any machine. Override COPILOT_TOKEN_DIR in .env if token.json
+    # lives elsewhere.
+    - ${COPILOT_TOKEN_DIR:-${USERPROFILE:-${HOME:-/tmp}}/.copilot-standalone}:/opt/airflow/.copilot-standalone:ro
   depends_on:
     postgres:
       condition: service_healthy
