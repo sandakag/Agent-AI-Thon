@@ -58,46 +58,128 @@ def hardened_source() -> str | None:
         return None
 
 
-_MARKER_PREFIX = "# guardian-runtime-remediation:"
+# --- Real per-incident code repairs -----------------------------------------
+# Each repair adds ONE genuine resilience construct to the live parser, so the
+# guardian's staged PR is a REAL code fix (not a comment) that a human reviews
+# and merges to harden production.
+_RESOLVE_ALIAS_HELPER = (
+    "\n\ndef _resolve_alias(record: dict, names: tuple):\n"
+    "    \"\"\"Return the first present alias of a (possibly renamed) upstream field.\"\"\"\n"
+    "    for _n in names:\n"
+    "        if record.get(_n) is not None:\n"
+    "            return record.get(_n)\n"
+    "    return None\n"
+)
+_HARD_PRICE = '        price = _to_float(_resolve_alias(r, ("price", "px", "p", "prc")))'
+_HARD_SIZE = '        size = _to_float(_resolve_alias(r, ("size", "qty", "quantity", "sz")))'
+_DEDUP_BLOCK = (
+    "    # Idempotency fix: drop at-least-once duplicate redeliveries by trade_id\n"
+    "    # so a replay storm never double-counts revenue.\n"
+    "    _seen, _deduped = set(), []\n"
+    "    for _p in parsed:\n"
+    "        _tid = _p.get(\"trade_id\")\n"
+    "        if _tid is not None and _tid in _seen:\n"
+    "            continue\n"
+    "        _seen.add(_tid)\n"
+    "        _deduped.append(_p)\n"
+    "    parsed = _deduped\n"
+)
+_QUARANTINE_BLOCK = (
+    "    # Resilience fix: quarantine null-amount records and publish the VALID\n"
+    "    # subset instead of failing the whole batch, so a burst of bad records\n"
+    "    # never zeroes revenue.\n"
+    "    if total and null_rate >= config.NULL_RATE_CRITICAL:\n"
+    "        valid = [p for p in parsed if p[\"amount\"] is not None]\n"
+    "        if valid:\n"
+    "            good = aggregate(valid)\n"
+    "            result[\"aggregate\"] = good\n"
+    "            result[\"quarantined\"] = nulls\n"
+    "            result[\"warehouse\"] = load(good)\n"
+    "            result[\"error\"] = (\n"
+    "                \"quarantined %d null-amount records; published %d valid\"\n"
+    "                % (nulls, len(valid))\n"
+    "            )\n"
+    "            return result\n"
+)
 
 
-def _strip_markers(text: str) -> str:
-    """Drop guardian remediation marker lines so the parser core can be compared."""
-    return "".join(
-        line for line in (text or "").splitlines(keepends=True)
-        if not line.startswith(_MARKER_PREFIX)
-    )
+def _fix_schema(src: str) -> str | None:
+    """Add upstream field-alias resolution (px/quantity/…) to parse_trades."""
+    import re
+    changed = False
+    if "_resolve_alias" not in src:
+        anchor = "    except (TypeError, ValueError):\n        return None\n"
+        if anchor in src:
+            src = src.replace(anchor, anchor + _RESOLVE_ALIAS_HELPER, 1)
+            changed = True
+    new = re.sub(r"        price = _to_float\([^\n]*\)", _HARD_PRICE, src, count=1)
+    if new != src:
+        src, changed = new, True
+    new = re.sub(r"        size = _to_float\([^\n]*\)", _HARD_SIZE, src, count=1)
+    if new != src:
+        src, changed = new, True
+    return src if changed else None
+
+
+def _fix_dup(src: str) -> str | None:
+    """Add trade_id de-duplication so a replay/dup storm cannot double-count."""
+    if "_deduped" in src:
+        return None
+    anchor = "    parsed = parse_trades(raw)\n"
+    if anchor not in src:
+        return None
+    return src.replace(anchor, anchor + _DEDUP_BLOCK, 1)
+
+
+def _fix_null(src: str) -> str | None:
+    """Add null-amount quarantine so a null/malformed surge cannot zero revenue."""
+    if 'result["quarantined"]' in src:
+        return None
+    anchor = "    if total == 0 or null_rate >= config.NULL_RATE_CRITICAL:"
+    if anchor not in src:
+        return None
+    return src.replace(anchor, _QUARANTINE_BLOCK + "\n" + anchor, 1)
+
+
+# Map an incident's failure-type keyword to its REAL code repair. A recognized
+# incident with no targeted repair falls back to the full hardened restore.
+_REPAIRS = (
+    ("schema", _fix_schema),
+    ("parse", _fix_schema),
+    ("duplicate", _fix_dup),
+    ("dup", _fix_dup),
+    ("null", _fix_null),
+    ("quality", _fix_null),
+    ("corrupt", _fix_null),
+    ("type", _fix_null),
+)
 
 
 def deterministic_fix(failure_type: str, current_content: str) -> tuple[str, str] | None:
-    """Return ``(new_etl_py_contents, change_description)`` for a RECOGNIZED
-    runtime incident, or None when the failure type is unknown or no hardened
-    reference exists.
+    """Author a REAL per-incident code repair for a recognized runtime incident.
 
-    Two cases keep the guardian producing a REAL, human-mergeable code diff:
-      * the parser CORE is still VULNERABLE  -> restore the full hardened parser
-        (a genuine functional fix), or
-      * the parser CORE is ALREADY hardened  -> the parser already defends this
-        incident class, so stage a small per-incident remediation record. It is a
-        real, idempotent one-line change (skipped if already present) so the human
-        still reviews + merges a PR and the pipeline recovery workflow completes.
-    """
+    Adds the specific missing defense — alias resolution / de-duplication / null
+    quarantine — as genuine code (not a comment). Returns None when the failure
+    type is unknown OR the defense is already present (so no duplicate PR).
+    A recognized incident with no targeted repair falls back to restoring the
+    full hardened parser (still a real code change)."""
     label = _label_for(failure_type)
     if label is None:
         return None  # unknown incident -> let a generative model try instead
-    hardened = hardened_source()
-    if not hardened:
-        return None
-
     current = current_content or ""
-    if hardened.strip() != _strip_markers(current).strip():
-        # Vulnerable parser core -> full hardened restore (real functional repair).
-        return hardened if hardened.endswith("\n") else hardened + "\n", label
+    ft = (failure_type or "").lower()
+    for key, repair in _REPAIRS:
+        if key in ft:
+            fixed = repair(current)
+            if fixed is None:
+                return None  # defense already present -> nothing to change
+            try:
+                compile(fixed, "pipeline/etl.py", "exec")
+            except SyntaxError:
+                break  # fall through to full restore
+            return (fixed if fixed.endswith("\n") else fixed + "\n"), label
 
-    # Already hardened -> record a per-incident runtime remediation (real diff).
-    sig = "".join(c if c.isalnum() else "-" for c in (failure_type or "").lower()).strip("-") or "incident"
-    marker = f"{_MARKER_PREFIX} {sig}\n"
-    if marker in current:
-        return None  # this incident class was already remediated
-    new_content = current.rstrip("\n") + "\n" + marker
-    return new_content, f"{label} (record runtime remediation for {sig})"
+    hardened = hardened_source()
+    if not hardened or hardened.strip() == current.strip():
+        return None
+    return (hardened if hardened.endswith("\n") else hardened + "\n"), label

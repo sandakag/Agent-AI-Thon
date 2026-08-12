@@ -222,6 +222,7 @@ def main() -> None:
     active_fix_label: str | None = None
     fix_tick = 0
     tick = 0
+    latched_prediction: dict | None = None  # keeps an induced incident RED until resolved
     # PRs already merged BEFORE this process started are history, not events.
     try:
         seen_merged = {p["number"] for p in github_gov.merged_guardian_prs()}
@@ -347,6 +348,23 @@ def main() -> None:
             # a background thread so this loop never blocks on a model call.
             prediction = agent.predict(collector, INTERVAL, use_llm=False)
             decision = decide(prediction)
+
+            # LATCH an induced incident so the banner WAITS for the human fix.
+            # A sustained fault becomes the anomaly detector's "new normal" after a
+            # few ticks (risk drops), which would self-heal the banner before the
+            # operator merges the PR. While a custom incident is active and not yet
+            # recovering, keep showing the escalated prediction until it is resolved
+            # by a merged fix, an Apply-fix click, or Clear (which sets recovery /
+            # switches the mode and clears the latch below).
+            if active_mode == "custom" and recovery_left == 0:
+                if decision["level"] in ("AMBER", "RED"):
+                    latched_prediction = prediction
+                elif latched_prediction is not None:
+                    prediction = latched_prediction
+                    decision = decide(prediction)
+            else:
+                latched_prediction = None
+
             emit(tick, prediction, decision)
             if decision["level"] == "GREEN":
                 clear_incident()
