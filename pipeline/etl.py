@@ -1,12 +1,17 @@
-"""Transform + Load — the VULNERABLE baseline data-plane (demo reset target).
+"""Transform + Load — the clean ETL data-plane (Extract already done upstream).
 
-This is the intentionally un-hardened parser the demo starts from: it reads
-``price``/``size`` with NO alias resolution (schema-drift breaks it), does NO
-de-duplication (a dup storm double-counts) and NO null quarantine (a null surge
-hard-fails the batch). The guardian predicts the incident and stages a PR that
-restores ``pipeline/etl_hardened.py`` — the fully-hardened version — which a
-human merges to heal production. ``reset_stacks`` copies THIS file back over
-``pipeline/etl.py`` so the next audience starts from the same vulnerable state.
+``parse``      raw trade -> ``{product, amount, ts, trade_id, side}`` where
+               ``amount = price * size`` (USD value of the trade). A record
+               whose price/size is missing or unparseable yields ``amount=None``
+               (a NULL).
+``aggregate``  revenue per product + a grand total.
+``load``       idempotent upsert into a JSON "warehouse" keyed by
+               ``(product, run_date)``.
+
+Production failure condition (a latent resilience gap, exactly like a real
+postmortem): the load stage refuses to publish when the batch is mostly NULL
+amounts (``null_rate >= NULL_RATE_CRITICAL``) — otherwise revenue would
+silently read $0 — so it fails. That is the incident the agent must predict.
 """
 
 from __future__ import annotations
@@ -87,9 +92,16 @@ def run_etl(raw: list[dict]) -> dict:
     """Full parse -> aggregate -> load. Returns a result dict; sets
     ``failed=True`` and skips the load when the batch is too NULL to publish."""
     parsed = parse_trades(raw)
-    # VULNERABLE BASELINE: no de-duplication (a replay/dup storm double-counts
-    # revenue) and no null quarantine (a null/schema-drift surge hard-fails the
-    # whole batch). The guardian's staged fix restores these defenses.
+    # Idempotency fix: drop at-least-once duplicate redeliveries by
+    # trade_id so a replay storm never double-counts revenue.
+    _seen, _deduped = set(), []
+    for _p in parsed:
+        _tid = _p.get("trade_id")
+        if _tid is not None and _tid in _seen:
+            continue
+        _seen.add(_tid)
+        _deduped.append(_p)
+    parsed = _deduped
     total = len(parsed)
     nulls = sum(1 for p in parsed if p["amount"] is None)
     null_rate = (nulls / total) if total else 1.0
@@ -105,6 +117,21 @@ def run_etl(raw: list[dict]) -> dict:
         "error": None,
     }
 
+    # Resilience fix: quarantine null-amount records and publish the VALID
+    # subset instead of failing the whole batch, so a burst of bad upstream
+    # records never zeroes revenue. Alert on the quarantined count.
+    if total and null_rate >= config.NULL_RATE_CRITICAL:
+        valid = [p for p in parsed if p["amount"] is not None]
+        if valid:
+            good = aggregate(valid)
+            result["aggregate"] = good
+            result["quarantined"] = nulls
+            result["warehouse"] = load(good)
+            result["error"] = (
+                "quarantined %d null-amount records; published %d valid"
+                % (nulls, len(valid))
+            )
+            return result
     if total == 0 or null_rate >= config.NULL_RATE_CRITICAL:
         result["failed"] = True
         result["error"] = (
