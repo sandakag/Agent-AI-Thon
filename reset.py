@@ -8,6 +8,7 @@ anything.  The presenter retains control of the subsequent push and review.
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -47,15 +48,46 @@ def prepare() -> None:
     catalog_path.write_text(json.dumps(KNOWN_RUNTIME_INCIDENTS, indent=2), encoding="utf-8")
 
 
+def cleanup_remote() -> None:
+    """OPTIONAL (``--full``): close every guardian-created GitHub issue/PR, delete
+    the ``guardian/fix-*`` branches, and purge Grafana annotations/incidents so a
+    repeat demo starts from a clean slate. Best-effort; skipped when credentials
+    are absent. This closes AI-created artifacts only — it never merges anything."""
+    from governance import github_gov, grafana_gov
+    try:
+        github_gov.cleanup_all()
+    except Exception as exc:  # noqa: BLE001 - best-effort, never abort the reset
+        print(f"    -> [reset] GitHub cleanup skipped: {exc}")
+    try:
+        grafana_gov.purge_annotations()
+        grafana_gov.resolve_incidents()
+    except Exception as exc:  # noqa: BLE001
+        print(f"    -> [reset] Grafana cleanup skipped: {exc}")
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Reset the demo to its repeatable vulnerable starting state.")
+    parser.add_argument(
+        "--full", action="store_true",
+        help="also close guardian GitHub issues/PRs + purge Grafana (clean repeat)")
+    args = parser.parse_args()
+
     try:
         prepare()
     except (OSError, ValueError) as exc:
         print(f"Demo reset stopped safely: {exc}")
         return 1
+    if args.full:
+        cleanup_remote()
+
     print("Demo reset complete.")
     print("Phase 1: pipeline/etl.py now contains the controlled px-alias CI fault.")
     print("Phase 2: six runtime incident presets are restored in data/demo_incidents.json.")
+    for item in KNOWN_RUNTIME_INCIDENTS:
+        print(f"    - {item['button']:18s} {item['id']}")
+    if not args.full:
+        print("(run with --full to also close old guardian issues/PRs + purge Grafana)")
     print("Review and push this reset commit yourself; the system never pushes or merges it.")
     return 0
 
