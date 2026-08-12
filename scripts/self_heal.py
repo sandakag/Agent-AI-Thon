@@ -21,6 +21,7 @@ from agent.copilot_api import CopilotApiBrain
 from agent.copilot_cli import CopilotCliBrain
 from agent.gemini import GeminiBrain
 from agent.groq import GroqBrain
+from agent.playbook import PlaybookBrain
 
 ROOT = Path(__file__).resolve().parents[1]
 # Groq's entry tier permits 12k tokens per minute. Keep the entire repair prompt
@@ -128,7 +129,9 @@ REPOSITORY SOURCE:
 {source_context()}
 """
     system = "You are a careful senior Python maintainer."
-    brains = [CopilotCliBrain(), CopilotApiBrain(), GroqBrain(), GeminiBrain()]
+    # PlaybookBrain is a deterministic last resort: it only fires when the
+    # failure log matches a signature it already has a verified fix for.
+    brains = [CopilotCliBrain(), CopilotApiBrain(), GroqBrain(), GeminiBrain(), PlaybookBrain()]
     problems: list[str] = []
     for brain in brains:
         if not brain.available:
