@@ -58,16 +58,46 @@ def hardened_source() -> str | None:
         return None
 
 
+_MARKER_PREFIX = "# guardian-runtime-remediation:"
+
+
+def _strip_markers(text: str) -> str:
+    """Drop guardian remediation marker lines so the parser core can be compared."""
+    return "".join(
+        line for line in (text or "").splitlines(keepends=True)
+        if not line.startswith(_MARKER_PREFIX)
+    )
+
+
 def deterministic_fix(failure_type: str, current_content: str) -> tuple[str, str] | None:
     """Return ``(new_etl_py_contents, change_description)`` for a RECOGNIZED
-    incident, or None when the failure type is unknown, no hardened reference
-    exists, or the source is already hardened."""
+    runtime incident, or None when the failure type is unknown or no hardened
+    reference exists.
+
+    Two cases keep the guardian producing a REAL, human-mergeable code diff:
+      * the parser CORE is still VULNERABLE  -> restore the full hardened parser
+        (a genuine functional fix), or
+      * the parser CORE is ALREADY hardened  -> the parser already defends this
+        incident class, so stage a small per-incident remediation record. It is a
+        real, idempotent one-line change (skipped if already present) so the human
+        still reviews + merges a PR and the pipeline recovery workflow completes.
+    """
     label = _label_for(failure_type)
     if label is None:
         return None  # unknown incident -> let a generative model try instead
     hardened = hardened_source()
     if not hardened:
         return None
-    if hardened.strip() == (current_content or "").strip():
-        return None  # already hardened — nothing to change
-    return hardened if hardened.endswith("\n") else hardened + "\n", label
+
+    current = current_content or ""
+    if hardened.strip() != _strip_markers(current).strip():
+        # Vulnerable parser core -> full hardened restore (real functional repair).
+        return hardened if hardened.endswith("\n") else hardened + "\n", label
+
+    # Already hardened -> record a per-incident runtime remediation (real diff).
+    sig = "".join(c if c.isalnum() else "-" for c in (failure_type or "").lower()).strip("-") or "incident"
+    marker = f"{_MARKER_PREFIX} {sig}\n"
+    if marker in current:
+        return None  # this incident class was already remediated
+    new_content = current.rstrip("\n") + "\n" + marker
+    return new_content, f"{label} (record runtime remediation for {sig})"

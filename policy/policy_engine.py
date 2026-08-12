@@ -26,6 +26,6 @@ def decide(prediction: dict) -> dict:
         "level": level,
         "should_alert": level in ("AMBER", "RED"),
         "should_open_issue": level in ("AMBER", "RED"),  # predicted-incident ticket, early
-        "should_open_pr": level == "RED",                # gated preventive fix
+        "should_open_pr": level in ("AMBER", "RED"),      # gated preventive fix (never auto-merged)
         "recommendation": prediction.get("recommended_action", ""),
     }
