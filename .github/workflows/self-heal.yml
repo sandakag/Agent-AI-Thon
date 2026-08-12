@@ -70,11 +70,13 @@ jobs:
           git add -- ':!failed-ci.log'
           git commit -m "self-heal: repair failed CI run ${{ github.event.workflow_run.id }}"
           git push --set-upstream origin $branch
-          $url = gh pr create --base main --head $branch --title "[self-heal] Copilot repair for CI run ${{ github.event.workflow_run.id }}" --body "GitHub Copilot authored the repair from failed CI logs: ${{ github.event.workflow_run.html_url }}`n`nThe safety guard accepted the patch and the full test suite passed before this PR was created."
+          $url = gh pr create --base main --head $branch --title "[self-heal] Copilot repair for CI run ${{ github.event.workflow_run.id }}" --body "GitHub Copilot authored the repair from failed CI logs: ${{ github.event.workflow_run.html_url }}`n`nThe safety guard accepted the patch and the full test suite passed before this PR was created.`n`n**A human must review and merge this PR — the self-heal workflow never merges automatically.**"
           "url=$url" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
-      - name: Wait for PR CI, then merge only on success
+      - name: Wait for PR CI, then STOP for human merge
         shell: pwsh
         run: |
           $prNumber = gh pr view '${{ steps.pr.outputs.url }}' --json number --jq .number
+          # Confirm the repair is green, then hand off. The workflow deliberately
+          # does NOT merge — a human reviewer merges the PR.
           gh pr checks $prNumber --watch --fail-fast
-          gh pr merge $prNumber --squash --delete-branch
+          Write-Host "Repair PR #$prNumber is green and awaiting human review/merge. This workflow will NOT merge it."
