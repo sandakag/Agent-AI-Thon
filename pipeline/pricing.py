@@ -12,4 +12,4 @@ from __future__ import annotations
 
 def round_amount(amount: float) -> float:
     """Round a computed trade amount to the nearest cent (2 decimal places)."""
-    return round(amount, 2)
+    return round(amount)
