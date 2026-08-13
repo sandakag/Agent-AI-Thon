@@ -1,9 +1,17 @@
-"""Prepare a repeatable two-phase demo starting state.
+"""Prepare a repeatable two-phase demo starting state — reset ONCE at the start.
 
 Run ``python reset.py`` after pulling ``main`` and before committing the demo
-reset.  It changes only local, generated demo state and ``pipeline/etl.py``;
-it deliberately does not commit, push, create GitHub artifacts, or merge
-anything.  The presenter retains control of the subsequent push and review.
+reset. It changes only local, generated demo state, ``pipeline/pricing.py``
+(Phase 1's CI fault) and ``pipeline/etl.py`` (Phase 2's runtime-incident
+vulnerability); it deliberately does not commit, push, create GitHub artifacts,
+or merge anything. The presenter retains control of the subsequent push and
+review.
+
+Phase 1's CI fault lives ENTIRELY in ``pipeline/pricing.py``, a module
+independent of ``pipeline/etl.py``. Healing it (the self-heal ML known-fix
+analyzer) only ever touches ``pricing.py``, so it can never re-harden the
+``pipeline/etl.py`` vulnerability Phase 2 needs. Both phases are therefore
+ready immediately after this ONE reset — no reset is needed between them.
 """
 
 from __future__ import annotations
@@ -17,32 +25,35 @@ from incidents import KNOWN_RUNTIME_INCIDENTS
 from reset_stacks import reset_local
 
 
-_BASELINE = config.ROOT / "pipeline" / "etl_baseline.py"
-_TARGET = config.ROOT / "pipeline" / "etl.py"
-_SIZE_LINE = '        size = _to_float(r.get("size"))'
-_SIZE_COMPATIBLE = '        size = _to_float(r.get("size") if r.get("size") is not None else r.get("qty"))'
+_ETL_BASELINE = config.ROOT / "pipeline" / "etl_baseline.py"
+_ETL_TARGET = config.ROOT / "pipeline" / "etl.py"
+_PRICING_TARGET = config.ROOT / "pipeline" / "pricing.py"
+_PRICING_FIXED = "    return round(amount, 2)\n"
+_PRICING_BROKEN = "    return round(amount)\n"
 
 
-def phase_one_demo_source(baseline: str) -> str:
-    """Return the safe reset source for the CI demonstration.
-
-    The only deliberate CI fault is the missing ``price -> px`` alias.  The
-    companion ``qty`` alias remains present so the known-fix playbook can repair
-    one minimal line and turn CI green after a human merges its PR.  The remaining
-    baseline resilience gaps are intentionally left for Phase 2's runtime demo.
-    """
-    if _SIZE_LINE not in baseline:
-        raise ValueError("Unexpected ETL baseline; refusing to create demo state.")
-    source = baseline.replace(_SIZE_LINE, _SIZE_COMPATIBLE, 1)
-    if 'price = _to_float(r.get("price"))' not in source:
-        raise ValueError("Expected Phase 1 price-alias fault is missing from baseline.")
-    return source
+def phase_one_demo_source(pricing_source: str) -> str:
+    """Return ``pipeline/pricing.py`` with the ONE controlled, independent CI
+    fault: rounding silently drops its decimal-places argument. This never
+    touches ``pipeline/etl.py``, so Phase 2's runtime-incident vulnerability is
+    unaffected by injecting or by healing this fault."""
+    if _PRICING_FIXED not in pricing_source:
+        raise ValueError("Unexpected pipeline/pricing.py; refusing to create demo state.")
+    return pricing_source.replace(_PRICING_FIXED, _PRICING_BROKEN, 1)
 
 
 def prepare() -> None:
-    """Reset local artifacts and write the deterministic Phase 1/2 starting state."""
-    baseline = _BASELINE.read_text(encoding="utf-8")
-    _TARGET.write_text(phase_one_demo_source(baseline), encoding="utf-8")
+    """Reset local artifacts and write the deterministic Phase 1 + Phase 2
+    starting state in one shot (no reset needed between the two phases)."""
+    # Phase 1: the ONE independent CI fault, isolated to pricing.py.
+    pricing_source = _PRICING_TARGET.read_text(encoding="utf-8")
+    _PRICING_TARGET.write_text(phase_one_demo_source(pricing_source), encoding="utf-8")
+
+    # Phase 2: pipeline/etl.py starts VULNERABLE so a runtime incident can be
+    # induced immediately after Phase 1 completes -- no reset in between.
+    baseline = _ETL_BASELINE.read_text(encoding="utf-8")
+    _ETL_TARGET.write_text(baseline, encoding="utf-8")
+
     reset_local()
     catalog_path = config.DATA_DIR / "demo_incidents.json"
     catalog_path.write_text(json.dumps(KNOWN_RUNTIME_INCIDENTS, indent=2), encoding="utf-8")
@@ -82,8 +93,9 @@ def main() -> int:
         cleanup_remote()
 
     print("Demo reset complete.")
-    print("Phase 1: pipeline/etl.py now contains the controlled px-alias CI fault.")
-    print("Phase 2: six runtime incident presets are restored in data/demo_incidents.json.")
+    print("Phase 1: pipeline/pricing.py now contains the controlled, independent CI fault.")
+    print("Phase 2: pipeline/etl.py is now VULNERABLE and six runtime incidents are restored.")
+    print("Both phases are ready now -- no reset needed between Phase 1 and Phase 2.")
     for item in KNOWN_RUNTIME_INCIDENTS:
         print(f"    - {item['button']:18s} {item['id']}")
     if not args.full:

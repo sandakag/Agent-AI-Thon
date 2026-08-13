@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from pipeline import etl
+from pipeline import etl, pricing
 from scripts import demo_vulnerability
 from governance import github_gov
 from incidents import KNOWN_RUNTIME_INCIDENTS, ids
@@ -34,6 +34,12 @@ class EtlSmokeTests(unittest.TestCase):
         load.assert_not_called()
 
 
+class PricingTests(unittest.TestCase):
+    def test_round_amount_rounds_to_cents(self) -> None:
+        self.assertEqual(pricing.round_amount(12.3456), 12.35)
+        self.assertEqual(pricing.round_amount(1.0), 1.0)
+
+
 class DemoVulnerabilityTests(unittest.TestCase):
     def test_demo_fault_is_reversible(self) -> None:
         hardened = demo_vulnerability.HARDENED
@@ -59,29 +65,25 @@ class DemoVulnerabilityTests(unittest.TestCase):
 
 class RepeatableDemoTests(unittest.TestCase):
     def test_reset_source_has_one_controlled_ci_fault(self) -> None:
-        baseline = (demo_vulnerability.ROOT / "pipeline" / "etl_baseline.py").read_text(
+        pricing_source = (demo_vulnerability.ROOT / "pipeline" / "pricing.py").read_text(
             encoding="utf-8"
         )
-        source = phase_one_demo_source(baseline)
-        self.assertIn('price = _to_float(r.get("price"))', source)
-        self.assertIn('r.get("qty")', source)
-        compile(source, "pipeline/etl.py", "exec")
-        namespace = {"__name__": "demo_etl"}
+        source = phase_one_demo_source(pricing_source)
+        self.assertIn("return round(amount)", source)
+        self.assertNotIn("return round(amount, 2)", source)
+        compile(source, "pipeline/pricing.py", "exec")
+        namespace: dict = {}
         exec(source, namespace)
-        self.assertIsNone(namespace["parse_trades"]([
-            {"product": "BTC-USD", "px": "100", "qty": "0.25"}
-        ])[0]["amount"])
+        # The independent Phase 1 fault: rounding silently drops decimal places.
+        self.assertEqual(namespace["round_amount"](12.3456), 12)
+        # Phase 1's fix never touches pipeline/etl.py -- Phase 2's vulnerability
+        # (missing alias resolution / dedup / null-quarantine) is unaffected.
         repaired = source.replace(
-            '        price = _to_float(r.get("price"))\n',
-            '        price = _to_float(r.get("price") if r.get("price") '
-            'is not None else r.get("px"))\n',
-            1,
+            "    return round(amount)\n", "    return round(amount, 2)\n", 1
         )
-        namespace = {"__name__": "demo_etl"}
+        namespace = {}
         exec(repaired, namespace)
-        self.assertEqual(namespace["parse_trades"]([
-            {"product": "BTC-USD", "px": "100", "qty": "0.25"}
-        ])[0]["amount"], 25.0)
+        self.assertEqual(namespace["round_amount"](12.3456), 12.35)
 
     def test_six_known_runtime_incidents_are_available(self) -> None:
         self.assertEqual(len(KNOWN_RUNTIME_INCIDENTS), 6)
