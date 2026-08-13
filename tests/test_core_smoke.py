@@ -94,10 +94,12 @@ class DemoVulnerabilityTests(unittest.TestCase):
 
 class RepeatableDemoTests(unittest.TestCase):
     def test_reset_source_has_one_controlled_ci_fault(self) -> None:
-        pricing_source = (demo_vulnerability.ROOT / "pipeline" / "pricing.py").read_text(
-            encoding="utf-8"
+        fixed = (
+            "def round_amount(amount: float) -> float:\n"
+            '    """Round a computed trade amount to the nearest cent."""\n'
+            "    return round(amount, 2)\n"
         )
-        source = phase_one_demo_source(pricing_source)
+        source = phase_one_demo_source(fixed)
         self.assertIn("return round(amount)", source)
         self.assertNotIn("return round(amount, 2)", source)
         compile(source, "pipeline/pricing.py", "exec")
@@ -105,13 +107,12 @@ class RepeatableDemoTests(unittest.TestCase):
         exec(source, namespace)
         # The independent Phase 1 fault: rounding silently drops decimal places.
         self.assertEqual(namespace["round_amount"](12.3456), 12)
+        # Idempotent: reset.py stays safe to run repeatedly.
+        self.assertEqual(phase_one_demo_source(source), source)
         # Phase 1's fix never touches pipeline/etl.py -- Phase 2's vulnerability
         # (missing alias resolution / dedup / null-quarantine) is unaffected.
-        repaired = source.replace(
-            "    return round(amount)\n", "    return round(amount, 2)\n", 1
-        )
         namespace = {}
-        exec(repaired, namespace)
+        exec(fixed, namespace)
         self.assertEqual(namespace["round_amount"](12.3456), 12.35)
 
     def test_six_known_runtime_incidents_are_available(self) -> None:

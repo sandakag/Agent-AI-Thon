@@ -36,7 +36,12 @@ def phase_one_demo_source(pricing_source: str) -> str:
     """Return ``pipeline/pricing.py`` with the ONE controlled, independent CI
     fault: rounding silently drops its decimal-places argument. This never
     touches ``pipeline/etl.py``, so Phase 2's runtime-incident vulnerability is
-    unaffected by injecting or by healing this fault."""
+    unaffected by injecting or by healing this fault.
+
+    Idempotent: re-running the reset when the fault is already present is a
+    no-op, so ``reset.py`` is always safe to run repeatedly."""
+    if _PRICING_BROKEN in pricing_source:
+        return pricing_source
     if _PRICING_FIXED not in pricing_source:
         raise ValueError("Unexpected pipeline/pricing.py; refusing to create demo state.")
     return pricing_source.replace(_PRICING_FIXED, _PRICING_BROKEN, 1)
