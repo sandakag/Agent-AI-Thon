@@ -76,7 +76,18 @@ jobs:
         shell: pwsh
         run: |
           $prNumber = gh pr view '${{ steps.pr.outputs.url }}' --json number --jq .number
-          # Confirm the repair is green, then hand off. The workflow deliberately
-          # does NOT merge — a human reviewer merges the PR.
+          # PR checks can take a few seconds to register; poll before watching so
+          # a race does not fail this hand-off step.
+          for ($i = 0; $i -lt 12; $i++) {
+            $checks = gh pr checks $prNumber 2>$null
+            if ($LASTEXITCODE -eq 0 -or $checks) { break }
+            Start-Sleep -Seconds 10
+          }
           gh pr checks $prNumber --watch --fail-fast
-          Write-Host "Repair PR #$prNumber is green and awaiting human review/merge. This workflow will NOT merge it."
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::PR CI not confirmed green here; review PR #$prNumber directly."
+          }
+          # The repair PR exists and awaits review. This workflow deliberately
+          # does NOT merge — a human reviewer merges the PR.
+          Write-Host "Repair PR #$prNumber is open and awaiting human review/merge. This workflow will NOT merge it."
+          exit 0
