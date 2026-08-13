@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from pipeline import etl, pricing
+from pipeline import etl, etl_hardened, pricing
 from scripts import demo_vulnerability
 from governance import github_gov
 from incidents import KNOWN_RUNTIME_INCIDENTS, ids
@@ -12,8 +12,43 @@ from reset import phase_one_demo_source
 
 
 class EtlSmokeTests(unittest.TestCase):
+    """Core ETL contract asserted against the LIVE pipeline/etl.py.
+
+    These hold in BOTH the hardened and the Phase 2 runtime-vulnerable state, so
+    inducing a runtime incident never turns CI red — the runtime hardening itself
+    is covered by EtlHardenedReferenceTests below.
+    """
+
+    def test_amount_is_price_times_size(self) -> None:
+        parsed = etl.parse_trades([{"product": "BTC-USD", "price": "100", "size": "0.25"}])
+        self.assertEqual(parsed[0]["amount"], 25.0)
+
+    def test_revenue_aggregates_per_product(self) -> None:
+        parsed = etl.parse_trades([
+            {"product": "BTC-USD", "price": "10", "size": "2"},
+            {"product": "ETH-USD", "price": "5", "size": "4"},
+        ])
+        agg = etl.aggregate(parsed)
+        self.assertEqual(agg["total_revenue"], 40.0)
+        self.assertEqual(agg["per_product"]["BTC-USD"], 20.0)
+
+    def test_all_invalid_rows_fail_closed(self) -> None:
+        with patch.object(etl, "load") as load:
+            result = etl.run_etl([{"product": "BTC-USD", "price": "bad", "size": "1"}])
+        self.assertTrue(result["failed"])
+        load.assert_not_called()
+
+
+class EtlHardenedReferenceTests(unittest.TestCase):
+    """The runtime hardening the guardian stages as a Phase 2 fix PR.
+
+    Asserted against pipeline/etl_hardened.py — the verified remediation target —
+    so this coverage never depends on the live parser's current demo state.
+    """
+
     def test_schema_aliases_produce_revenue(self) -> None:
-        parsed = etl.parse_trades([{"product": "BTC-USD", "px": "100", "qty": "0.25"}])
+        parsed = etl_hardened.parse_trades(
+            [{"product": "BTC-USD", "px": "100", "qty": "0.25"}])
         self.assertEqual(parsed[0]["amount"], 25.0)
 
     def test_duplicate_trades_are_not_double_counted(self) -> None:
@@ -21,17 +56,11 @@ class EtlSmokeTests(unittest.TestCase):
             {"product": "BTC-USD", "price": "10", "size": "2", "trade_id": "same"},
             {"product": "BTC-USD", "price": "10", "size": "2", "trade_id": "same"},
         ]
-        with patch.object(etl, "load", return_value={}) as load:
-            result = etl.run_etl(rows)
+        with patch.object(etl_hardened, "load", return_value={}) as load:
+            result = etl_hardened.run_etl(rows)
         self.assertFalse(result["failed"])
         self.assertEqual(result["aggregate"]["total_revenue"], 20.0)
         load.assert_called_once()
-
-    def test_all_invalid_rows_fail_closed(self) -> None:
-        with patch.object(etl, "load") as load:
-            result = etl.run_etl([{"product": "BTC-USD", "price": "bad", "size": "1"}])
-        self.assertTrue(result["failed"])
-        load.assert_not_called()
 
 
 class PricingTests(unittest.TestCase):
